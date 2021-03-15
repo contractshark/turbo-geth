@@ -49,7 +49,7 @@ rpctest:
 	@echo "Run \"$(GOBIN)/rpctest\" to launch rpctest."
 
 state:
-	$(GOBUILD) -o $(GOBIN)/stats ./cmd/state
+	$(GOBUILD) -o $(GOBIN)/state ./cmd/state
 	@echo "Done building."
 	@echo "Run \"$(GOBIN)/state\" to launch state."
 
