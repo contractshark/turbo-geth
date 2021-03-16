@@ -256,13 +256,18 @@ func TestInvalidTransactions(t *testing.T) {
 	}
 
 	tx = transaction(1, 100000, key)
-	pool.gasPrice = big.NewInt(1000)
+	pool.gasPrice = newInt(1000)
 	if err := pool.AddRemote(tx); err != ErrUnderpriced {
 		t.Error("expected", ErrUnderpriced, "got", err)
 	}
 	if err := pool.AddLocal(tx); err != nil {
 		t.Error("expected", nil, "got", err)
 	}
+}
+
+func newInt(value int64) *uint256.Int {
+	v, _ := uint256.FromBig(big.NewInt(value))
+	return v
 }
 
 func TestTransactionQueue(t *testing.T) {
@@ -1219,7 +1224,7 @@ func TestTransactionPoolRepricing(t *testing.T) {
 		t.Fatalf("pool internal state corrupted: %v", err)
 	}
 	// Reprice the pool and check that underpriced transactions get dropped
-	pool.SetGasPrice(big.NewInt(2))
+	pool.SetGasPrice(newInt(2))
 
 	pending, queued = pool.Stats()
 	if pending != 2 {
@@ -1336,13 +1341,13 @@ func TestTransactionPoolRepricingKeepsLocals(t *testing.T) {
 	validate()
 
 	// Reprice the pool and check that nothing is dropped
-	pool.SetGasPrice(big.NewInt(2))
+	pool.SetGasPrice(newInt(2))
 	validate()
 
-	pool.SetGasPrice(big.NewInt(2))
-	pool.SetGasPrice(big.NewInt(4))
-	pool.SetGasPrice(big.NewInt(8))
-	pool.SetGasPrice(big.NewInt(100))
+	pool.SetGasPrice(newInt(2))
+	pool.SetGasPrice(newInt(4))
+	pool.SetGasPrice(newInt(8))
+	pool.SetGasPrice(newInt(100))
 	validate()
 }
 
@@ -2042,6 +2047,7 @@ func TestBundles(t *testing.T) {
 		}
 		checkBundles(t, &pool, v.block, v.testTimestamp, v.expectedRes, v.expectedRemaining)
 	}
+<<<<<<< HEAD
 }
 
 func checkBundles(t *testing.T, pool *TxPool, block int64, timestamp uint64, expectedRes int, expectedRemaining int) {
@@ -2051,5 +2057,27 @@ func checkBundles(t *testing.T, pool *TxPool, block int64, timestamp uint64, exp
 	}
 	if len(pool.mevBundles) != expectedRemaining {
 		t.Fatalf("expected remaining bundles did not match got %d, expected %d", len(pool.mevBundles), expectedRemaining)
+=======
+	remotes := make([]*types.Transaction, 1000)
+	for i := 0; i < len(remotes); i++ {
+		remotes[i] = pricedTransaction(uint64(i), 100000, newInt(2), remoteKey) // Higher gasprice
+	}
+	// Benchmark importing the transactions into the queue
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		pool, _, _ := setupTxPool()
+		pool.currentState.AddBalance(account, newInt(100000000))
+		for _, local := range locals {
+			pool.AddLocal(local)
+		}
+		b.StartTimer()
+		// Assign a high enough balance for testing
+		pool.currentState.AddBalance(remoteAddr, newInt(100000000))
+		for i := 0; i < len(remotes); i++ {
+			pool.AddRemotes([]*types.Transaction{remotes[i]})
+		}
+		pool.Stop()
+>>>>>>> core tests compile now
 	}
 }
