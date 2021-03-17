@@ -2070,7 +2070,9 @@ func checkBundles(t *testing.T, pool *TxPool, block int64, timestamp uint64, exp
 		pool, _, _ := setupTxPool()
 		pool.currentState.AddBalance(account, newInt(100000000))
 		for _, local := range locals {
-			pool.AddLocal(local)
+			if err := pool.AddLocal(local); err != nil {
+				b.Fatal(err)
+			}
 		}
 		b.StartTimer()
 		// Assign a high enough balance for testing
