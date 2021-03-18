@@ -488,9 +488,22 @@ func TestTransactionDropping(t *testing.T) {
 	pool.promoteTx(account, tx0.Hash(), tx0)
 	pool.promoteTx(account, tx1.Hash(), tx1)
 	pool.promoteTx(account, tx2.Hash(), tx2)
+<<<<<<< HEAD
 	pool.enqueueTx(tx10.Hash(), tx10)
 	pool.enqueueTx(tx11.Hash(), tx11)
 	pool.enqueueTx(tx12.Hash(), tx12)
+=======
+
+	if _, err := pool.enqueueTx(tx10.Hash(), tx10, false, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.enqueueTx(tx11.Hash(), tx11, false, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.enqueueTx(tx12.Hash(), tx12, false, true); err != nil {
+		t.Fatal(err)
+	}
+>>>>>>> Fix lints, fork split test
 
 	// Check that pre and post validations leave the pool as is
 	if pool.pending[account].Len() != 3 {
