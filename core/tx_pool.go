@@ -1779,7 +1779,29 @@ func (t *txLookup) Remove(hash common.Hash) {
 	t.slots -= numSlots(t.all[hash])
 	slotsGauge.Update(int64(t.slots))
 
+<<<<<<< HEAD
 	delete(t.all, hash)
+=======
+	delete(t.locals, hash)
+	delete(t.remotes, hash)
+}
+
+// RemoteToLocals migrates the transactions belongs to the given locals to locals
+// set. The assumption is held the locals set is thread-safe to be used.
+func (t *txLookup) RemoteToLocals(locals *accountSet) int {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+
+	var migrated int
+	for hash, tx := range t.remotes {
+		if locals.containsTx(tx) {
+			t.locals[hash] = tx
+			delete(t.remotes, hash)
+			migrated++
+		}
+	}
+	return migrated
+>>>>>>> Fix lints
 }
 
 // numSlots calculates the number of slots needed for a single transaction.

@@ -1995,7 +1995,13 @@ func benchmarkFuturePromotion(b *testing.B, size int) {
 
 	for i := 0; i < size; i++ {
 		tx := transaction(uint64(1+i), 100000, key)
+<<<<<<< HEAD
 		pool.enqueueTx(tx.Hash(), tx)
+=======
+		if _, err := pool.enqueueTx(tx.Hash(), tx, false, true); err != nil {
+			b.Fatal(err)
+		}
+>>>>>>> Fix lints
 	}
 	// Benchmark the speed of pool validation
 	b.ResetTimer()
