@@ -278,7 +278,13 @@ func TestTransactionQueue(t *testing.T) {
 	from, _ := deriveSender(tx)
 	pool.currentState.AddBalance(from, uint256.NewInt().SetUint64(1000))
 
+<<<<<<< HEAD
 	pool.enqueueTx(tx.Hash(), tx)
+=======
+	if _, err := pool.enqueueTx(tx.Hash(), tx, false, true); err != nil {
+		t.Fatal(err)
+	}
+>>>>>>> Fix lints
 	<-pool.requestPromoteExecutables(newAccountSet(pool.signer, from))
 	if len(pool.pending) != 1 {
 		t.Error("expected valid txs to be 1 is", len(pool.pending))
@@ -287,7 +293,13 @@ func TestTransactionQueue(t *testing.T) {
 	tx = transaction(1, 100, key)
 	from, _ = deriveSender(tx)
 	pool.currentState.SetNonce(from, 2)
+<<<<<<< HEAD
 	pool.enqueueTx(tx.Hash(), tx)
+=======
+	if _, err := pool.enqueueTx(tx.Hash(), tx, false, true); err != nil {
+		t.Fatal(err)
+	}
+>>>>>>> Fix lints
 
 	<-pool.requestPromoteExecutables(newAccountSet(pool.signer, from))
 	if _, ok := pool.pending[from].txs.items[tx.Nonce()]; ok {
@@ -307,9 +319,21 @@ func TestTransactionQueue2(t *testing.T) {
 	from, _ := deriveSender(tx1)
 	pool.currentState.AddBalance(from, uint256.NewInt().SetUint64(1000))
 
+<<<<<<< HEAD
 	pool.enqueueTx(tx1.Hash(), tx1)
 	pool.enqueueTx(tx2.Hash(), tx2)
 	pool.enqueueTx(tx3.Hash(), tx3)
+=======
+	if _, err := pool.enqueueTx(tx1.Hash(), tx1, false, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.enqueueTx(tx2.Hash(), tx2, false, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.enqueueTx(tx3.Hash(), tx3, false, true); err != nil {
+		t.Fatal(err)
+	}
+>>>>>>> Fix lints
 
 	pool.promoteExecutables([]common.Address{from})
 	if len(pool.pending) != 1 {
