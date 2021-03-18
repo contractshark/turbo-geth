@@ -669,10 +669,14 @@ func (pool *TxPool) add(tx *types.Transaction, local bool) (replaced bool, err e
 	// If the transaction fails basic validation, discard it
 	if pool.currentState != nil {
 <<<<<<< HEAD
+<<<<<<< HEAD
 		if err = pool.validateTx(tx, local); err != nil {
 =======
 		if err := pool.validateTx(tx, isLocal); err != nil {
 >>>>>>> Compilation fixes
+=======
+		if err = pool.validateTx(tx, isLocal); err != nil {
+>>>>>>> Fix lints
 			log.Trace("Discarding invalid transaction", "hash", hash, "err", err)
 			invalidTxMeter.Mark(1)
 			return false, err
