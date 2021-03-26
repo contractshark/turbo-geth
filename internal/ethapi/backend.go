@@ -21,7 +21,6 @@ import (
 	"context"
 	"math/big"
 
-	"github.com/ledgerwatch/turbo-geth/accounts"
 	"github.com/ledgerwatch/turbo-geth/common"
 	"github.com/ledgerwatch/turbo-geth/consensus"
 	"github.com/ledgerwatch/turbo-geth/core"
@@ -43,7 +42,6 @@ type Backend interface {
 	Downloader() *downloader.Downloader
 	SuggestPrice(ctx context.Context) (*big.Int, error)
 	ChainDb() ethdb.Database
-	AccountManager() *accounts.Manager
 	ExtRPCEnabled() bool
 	RPCGasCap() uint64        // global gas cap for eth_call over rpc: DoS protection
 	RPCTxFeeCap() float64     // global tx fee cap for all transaction related APIs
@@ -124,6 +122,7 @@ func GetAPIs(apiBackend Backend) []rpc.API {
 			Namespace: "debug",
 			Version:   "1.0",
 			Service:   NewPrivateDebugAPI(apiBackend),
+<<<<<<< HEAD
 		}, {
 			Namespace: "eth",
 			Version:   "1.0",
@@ -144,6 +143,8 @@ func GetAPIs(apiBackend Backend) []rpc.API {
 			Version:   "1.0",
 			Service:   NewBundleAPI(apiBackend),
 			Public:    true,
+=======
+>>>>>>> Remove puppeth & account management (#1610)
 		},
 	}
 }
