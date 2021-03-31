@@ -1356,6 +1356,7 @@ func checkTxFee(gasPrice *big.Int, gas uint64, cap float64) error {
 	}
 	return nil
 }
+<<<<<<< HEAD
 
 // toHexSlice creates a slice of hex-strings based on []byte.
 func toHexSlice(b [][]byte) []string {
@@ -1533,3 +1534,5 @@ func (s *BundleAPI) CallBundle(ctx context.Context, encodedTxs []hexutil.Bytes, 
 	ret["bundleHash"] = "0x" + common.Bytes2Hex(bundleHash.Sum(nil))
 	return ret, nil
 }
+=======
+>>>>>>> old loader remove v1 (#1641)
