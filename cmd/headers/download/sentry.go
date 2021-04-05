@@ -6,7 +6,6 @@ import (
 	"crypto/ecdsa"
 	"fmt"
 	"io"
-	"math/big"
 	"net"
 	"os"
 	"os/signal"
@@ -20,12 +19,14 @@ import (
 	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	grpc_recovery "github.com/grpc-ecosystem/go-grpc-middleware/recovery"
 	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
-	proto_sentry "github.com/ledgerwatch/turbo-geth/cmd/headers/sentry"
 	"github.com/ledgerwatch/turbo-geth/common"
 	"github.com/ledgerwatch/turbo-geth/core/forkid"
 	"github.com/ledgerwatch/turbo-geth/core/types"
 	"github.com/ledgerwatch/turbo-geth/crypto"
-	"github.com/ledgerwatch/turbo-geth/eth"
+	"github.com/ledgerwatch/turbo-geth/eth/protocols/eth"
+	"github.com/ledgerwatch/turbo-geth/gointerfaces"
+	proto_sentry "github.com/ledgerwatch/turbo-geth/gointerfaces/sentry"
+	proto_types "github.com/ledgerwatch/turbo-geth/gointerfaces/types"
 	"github.com/ledgerwatch/turbo-geth/log"
 	"github.com/ledgerwatch/turbo-geth/metrics"
 	"github.com/ledgerwatch/turbo-geth/p2p"
@@ -34,7 +35,6 @@ import (
 	"github.com/ledgerwatch/turbo-geth/p2p/nat"
 	"github.com/ledgerwatch/turbo-geth/p2p/netutil"
 	"github.com/ledgerwatch/turbo-geth/params"
-	"github.com/ledgerwatch/turbo-geth/turbo/stages/headerdownload"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -56,33 +56,6 @@ func nodeKey() *ecdsa.PrivateKey {
 	return key
 }
 
-// SentryMsg declares ID fields necessary for communicating with the sentry
-type SentryMsg struct {
-	sentryId  int
-	requestId int
-}
-
-// NewBlockFromSentry is a type of message sent from sentry to the downloader as a result of NewBlockMsg
-type NewBlockFromSentry struct {
-	SentryMsg
-	eth.NewBlockData
-}
-
-type NewBlockHashFromSentry struct {
-	SentryMsg
-	eth.NewBlockHashesData
-}
-
-type BlockHeadersFromSentry struct {
-	SentryMsg
-	headers []*types.Header
-}
-
-type PenaltyMsg struct {
-	SentryMsg
-	penalty headerdownload.Penalty
-}
-
 func makeP2PServer(
 	ctx context.Context,
 	natSetting string,
@@ -92,10 +65,11 @@ func makeP2PServer(
 	peerRwMap *sync.Map,
 	protocols []string,
 	ss *SentryServerImpl,
+	genesisHash common.Hash,
 ) (*p2p.Server, error) {
 	client := dnsdisc.NewClient(dnsdisc.Config{})
 
-	dns := params.KnownDNSNetwork(params.MainnetGenesisHash, "all")
+	dns := params.KnownDNSNetwork(genesisHash, "all")
 	dialCandidates, err := client.NewIterator(dns)
 	if err != nil {
 		return nil, fmt.Errorf("create discovery candidates: %v", err)
@@ -113,13 +87,33 @@ func makeP2PServer(
 	p2pConfig.Logger = log.New()
 	p2pConfig.MaxPeers = 100
 	p2pConfig.Protocols = []p2p.Protocol{}
-	p2pConfig.NodeDatabase = "downloader_nodes"
+	p2pConfig.NodeDatabase = fmt.Sprintf("nodes_%x", genesisHash)
 	p2pConfig.ListenAddr = fmt.Sprintf(":%d", port)
+	var urls []string
+	switch genesisHash {
+	case params.MainnetGenesisHash:
+		urls = params.MainnetBootnodes
+	case params.RopstenGenesisHash:
+		urls = params.RopstenBootnodes
+	case params.GoerliGenesisHash:
+		urls = params.GoerliBootnodes
+	}
+	p2pConfig.BootstrapNodes = make([]*enode.Node, 0, len(urls))
+	for _, url := range urls {
+		if url != "" {
+			node, err := enode.Parse(enode.ValidSchemes, url)
+			if err != nil {
+				log.Crit("Bootstrap URL invalid", "enode", url, "err", err)
+				continue
+			}
+			p2pConfig.BootstrapNodes = append(p2pConfig.BootstrapNodes, node)
+		}
+	}
 	pMap := map[string]p2p.Protocol{
 		eth.ProtocolName: {
 			Name:           eth.ProtocolName,
-			Version:        eth.ProtocolVersions[0],
-			Length:         eth.ProtocolLengths[eth.ProtocolVersions[0]],
+			Version:        eth.ProtocolVersions[1],
+			Length:         17,
 			DialCandidates: dialCandidates,
 			Run: func(peer *p2p.Peer, rw p2p.MsgReadWriter) error {
 				peerID := peer.ID().String()
@@ -132,8 +126,8 @@ func makeP2PServer(
 					peerRwMap,
 					peer,
 					rw,
-					eth.ProtocolVersions[0], // version == eth65
-					eth.ProtocolVersions[1], // minVersion == eth64
+					eth.ProtocolVersions[1], // version == eth65
+					eth.ProtocolVersions[2], // minVersion == eth64
 					ss,
 				); err != nil {
 					log.Info(fmt.Sprintf("[%s] Error while running peer: %v", peerID, err))
@@ -150,10 +144,6 @@ func makeP2PServer(
 		p2pConfig.Protocols = append(p2pConfig.Protocols, pMap[protocolName])
 	}
 	return &p2p.Server{Config: p2pConfig}, nil
-}
-
-func errResp(code int, format string, v ...interface{}) error {
-	return fmt.Errorf("%v - %v", code, fmt.Sprintf(format, v...))
 }
 
 func runPeer(
@@ -173,56 +163,61 @@ func runPeer(
 		return fmt.Errorf("could not get status message from core for peer %s connection", peerID)
 	}
 	// Convert proto status data into the one required by devp2p
-	genesisHash := common.BytesToHash(protoStatusData.ForkData.Genesis)
-	statusData := &eth.StatusData{
+	genesisHash := gointerfaces.ConvertH256ToHash(protoStatusData.ForkData.Genesis)
+	statusData := &eth.StatusPacket{
 		ProtocolVersion: uint32(version),
 		NetworkID:       protoStatusData.NetworkId,
-		TD:              new(big.Int).SetBytes(protoStatusData.TotalDifficulty),
-		Head:            common.BytesToHash(protoStatusData.BestHash),
+		TD:              gointerfaces.ConvertH256ToUint256Int(protoStatusData.TotalDifficulty).ToBig(),
+		Head:            gointerfaces.ConvertH256ToHash(protoStatusData.BestHash),
 		Genesis:         genesisHash,
-		ForkID:          forkid.NewIDFromForks(protoStatusData.ForkData.Forks, genesisHash),
+		ForkID:          forkid.NewIDFromForks(protoStatusData.ForkData.Forks, genesisHash, protoStatusData.MaxBlock),
 	}
-	forkFilter := forkid.NewFilterFromForks(protoStatusData.ForkData.Forks, genesisHash)
+	forkFilter := forkid.NewFilterFromForks(protoStatusData.ForkData.Forks, genesisHash, protoStatusData.MaxBlock)
 	networkID := protoStatusData.NetworkId
 	if err := p2p.Send(rw, eth.StatusMsg, statusData); err != nil {
 		return fmt.Errorf("handshake to peer %s: %v", peerID, err)
 	}
 	// Read handshake message
-	msg, err := rw.ReadMsg()
-	if err != nil {
-		return err
+	msg, err1 := rw.ReadMsg()
+	if err1 != nil {
+		return err1
 	}
 
 	if msg.Code != eth.StatusMsg {
 		msg.Discard()
-		return errResp(eth.ErrNoStatusMsg, "first msg has code %x (!= %x)", msg.Code, eth.StatusMsg)
+		return fmt.Errorf("first msg has code %x (!= %x)", msg.Code, eth.StatusMsg)
 	}
 	if msg.Size > eth.ProtocolMaxMsgSize {
 		msg.Discard()
-		return errResp(eth.ErrMsgTooLarge, "message is too large %d, limit %d", msg.Size, eth.ProtocolMaxMsgSize)
+		return fmt.Errorf("message is too large %d, limit %d", msg.Size, eth.ProtocolMaxMsgSize)
 	}
 	// Decode the handshake and make sure everything matches
-	var status eth.StatusData
-	if err = msg.Decode(&status); err != nil {
+	var status eth.StatusPacket
+	if err1 = msg.Decode(&status); err1 != nil {
 		msg.Discard()
-		return errResp(eth.ErrDecode, "decode message %v: %v", msg, err)
+		return fmt.Errorf("decode message %v: %v", msg, err1)
 	}
 	msg.Discard()
 	if status.NetworkID != networkID {
-		return errResp(eth.ErrNetworkIDMismatch, "network id does not match: theirs %d, ours %d", status.NetworkID, networkID)
+		return fmt.Errorf("network id does not match: theirs %d, ours %d", status.NetworkID, networkID)
 	}
 	if uint(status.ProtocolVersion) < minVersion {
-		return errResp(eth.ErrProtocolVersionMismatch, "version is less than allowed minimum: theirs %d, min %d", status.ProtocolVersion, minVersion)
+		return fmt.Errorf("version is less than allowed minimum: theirs %d, min %d", status.ProtocolVersion, minVersion)
 	}
 	if status.Genesis != genesisHash {
-		return errResp(eth.ErrGenesisMismatch, "genesis hash does not match: theirs %x, ours %x", status.Genesis, genesisHash)
+		return fmt.Errorf("genesis hash does not match: theirs %x, ours %x", status.Genesis, genesisHash)
 	}
-	if err = forkFilter(status.ForkID); err != nil {
-		return errResp(eth.ErrForkIDRejected, "%v", err)
+	if err1 = forkFilter(status.ForkID); err1 != nil {
+		return fmt.Errorf("%v", err1)
 	}
-	log.Info(fmt.Sprintf("[%s] Received status message OK", peerID), "name", peer.Name())
+	//log.Info(fmt.Sprintf("[%s] Received status message OK", peerID), "name", peer.Name())
 
 	for {
+		var err error
+		if err = common.Stopped(ctx.Done()); err != nil {
+			return err
+		}
+
 		if _, ok := peerRwMap.Load(peerID); !ok {
 			return fmt.Errorf("peer has been penalized")
 		}
@@ -232,51 +227,63 @@ func runPeer(
 		}
 		if msg.Size > eth.ProtocolMaxMsgSize {
 			msg.Discard()
-			return errResp(eth.ErrMsgTooLarge, "message is too large %d, limit %d", msg.Size, eth.ProtocolMaxMsgSize)
+			return fmt.Errorf("message is too large %d, limit %d", msg.Size, eth.ProtocolMaxMsgSize)
 		}
 		switch msg.Code {
 		case eth.StatusMsg:
 			msg.Discard()
 			// Status messages should never arrive after the handshake
-			return errResp(eth.ErrExtraStatusMsg, "uncontrolled status message")
+			return fmt.Errorf("uncontrolled status message")
 		case eth.GetBlockHeadersMsg:
-			if err = ss.forwardUploadMessage(msg, peerID, "GetBlockHeadersMsg", proto_sentry.MessageId_GetBlockHeaders); err != nil {
-				return err
+			b := make([]byte, msg.Size)
+			if _, err := io.ReadFull(msg.Payload, b); err != nil {
+				log.Error(fmt.Sprintf("%s: reading msg into bytes: %v", peerID, err))
 			}
+			ss.receiveUpload(&StreamMsg{b, peerID, "GetBlockHeadersMsg", proto_sentry.MessageId_GetBlockHeaders})
 		case eth.BlockHeadersMsg:
 			// Peer responded or sent message - reset the "back off" timer
 			peerTimeMap.Store(peerID, time.Now().Unix())
-			if err = ss.forwardMessage(msg, peerID, "BlockHeadersMsg", proto_sentry.MessageId_BlockHeaders); err != nil {
-				return err
+			b := make([]byte, msg.Size)
+			if _, err := io.ReadFull(msg.Payload, b); err != nil {
+				log.Error(fmt.Sprintf("%s: reading msg into bytes: %v", peerID, err))
 			}
+			ss.receive(&StreamMsg{b, peerID, "BlockHeadersMsg", proto_sentry.MessageId_BlockHeaders})
 		case eth.GetBlockBodiesMsg:
-			if err = ss.forwardUploadMessage(msg, peerID, "GetBlockBodiesMsg", proto_sentry.MessageId_GetBlockBodies); err != nil {
-				return err
+			b := make([]byte, msg.Size)
+			if _, err := io.ReadFull(msg.Payload, b); err != nil {
+				log.Error(fmt.Sprintf("%s: reading msg into bytes: %v", peerID, err))
 			}
+			ss.receiveUpload(&StreamMsg{b, peerID, "GetBlockBodiesMsg", proto_sentry.MessageId_GetBlockBodies})
 		case eth.BlockBodiesMsg:
 			// Peer responded or sent message - reset the "back off" timer
 			peerTimeMap.Store(peerID, time.Now().Unix())
-			if err = ss.forwardMessage(msg, peerID, "BlockBodiesMsg", proto_sentry.MessageId_BlockBodies); err != nil {
-				return err
+			b := make([]byte, msg.Size)
+			if _, err := io.ReadFull(msg.Payload, b); err != nil {
+				log.Error(fmt.Sprintf("%s: reading msg into bytes: %v", peerID, err))
 			}
+			ss.receive(&StreamMsg{b, peerID, "BlockBodiesMsg", proto_sentry.MessageId_BlockBodies})
 		case eth.GetNodeDataMsg:
-			log.Info(fmt.Sprintf("[%s] GetNodeData", peerID))
+			//log.Info(fmt.Sprintf("[%s] GetNodeData", peerID))
 		case eth.GetReceiptsMsg:
-			log.Info(fmt.Sprintf("[%s] GetReceiptsMsg", peerID))
+			//log.Info(fmt.Sprintf("[%s] GetReceiptsMsg", peerID))
 		case eth.ReceiptsMsg:
-			log.Info(fmt.Sprintf("[%s] ReceiptsMsg", peerID))
+			//log.Info(fmt.Sprintf("[%s] ReceiptsMsg", peerID))
 		case eth.NewBlockHashesMsg:
-			if err = ss.forwardMessage(msg, peerID, "NewBlockHashesMsg", proto_sentry.MessageId_NewBlockHashes); err != nil {
-				return err
+			b := make([]byte, msg.Size)
+			if _, err := io.ReadFull(msg.Payload, b); err != nil {
+				log.Error(fmt.Sprintf("%s: reading msg into bytes: %v", peerID, err))
 			}
+			ss.receive(&StreamMsg{b, peerID, "NewBlockHashesMsg", proto_sentry.MessageId_NewBlockHashes})
 		case eth.NewBlockMsg:
-			if err = ss.forwardMessage(msg, peerID, "NewBlockMsg", proto_sentry.MessageId_NewBlock); err != nil {
-				return err
+			b := make([]byte, msg.Size)
+			if _, err := io.ReadFull(msg.Payload, b); err != nil {
+				log.Error(fmt.Sprintf("%s: reading msg into bytes: %v", peerID, err))
 			}
+			ss.receive(&StreamMsg{b, peerID, "NewBlockMsg", proto_sentry.MessageId_NewBlock})
 		case eth.NewPooledTransactionHashesMsg:
 			var hashes []common.Hash
 			if err := msg.Decode(&hashes); err != nil {
-				return errResp(eth.ErrDecode, "decode NewPooledTransactionHashesMsg %v: %v", msg, err)
+				return fmt.Errorf("decode NewPooledTransactionHashesMsg %v: %v", msg, err)
 			}
 			var hashesStr strings.Builder
 			for _, hash := range hashes {
@@ -288,10 +295,10 @@ func runPeer(
 			//log.Info(fmt.Sprintf("[%s] NewPooledTransactionHashesMsg {%s}", peerID, hashesStr.String()))
 		case eth.GetPooledTransactionsMsg:
 			//log.Info(fmt.Sprintf("[%s] GetPooledTransactionsMsg", peerID)
-		case eth.TransactionMsg:
+		case eth.TransactionsMsg:
 			var txs []*types.Transaction
 			if err := msg.Decode(&txs); err != nil {
-				return errResp(eth.ErrDecode, "decode TransactionMsg %v: %v", msg, err)
+				return fmt.Errorf("decode TransactionMsg %v: %v", msg, err)
 			}
 			var hashesStr strings.Builder
 			for _, tx := range txs {
@@ -366,7 +373,10 @@ func grpcSentryServer(ctx context.Context, sentryAddr string) (*SentryServerImpl
 		grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(unaryInterceptors...)),
 	}
 	grpcServer = grpc.NewServer(opts...)
-	sentryServer := &SentryServerImpl{}
+	sentryServer := &SentryServerImpl{
+		receiveCh:       make(chan StreamMsg, 1024),
+		receiveUploadCh: make(chan StreamMsg, 1024),
+	}
 	proto_sentry.RegisterSentryServer(grpcServer, sentryServer)
 	if metrics.Enabled {
 		grpc_prometheus.Register(grpcServer)
@@ -381,6 +391,7 @@ func grpcSentryServer(ctx context.Context, sentryAddr string) (*SentryServerImpl
 
 func p2pServer(ctx context.Context,
 	sentryServer *SentryServerImpl,
+	genesisHash common.Hash,
 	natSetting string, port int, staticPeers []string, discovery bool, netRestrict string,
 ) (*p2p.Server, error) {
 	server, err := makeP2PServer(
@@ -392,6 +403,7 @@ func p2pServer(ctx context.Context,
 		&sentryServer.peerRwMap,
 		[]string{eth.ProtocolName},
 		sentryServer,
+		genesisHash,
 	)
 	if err != nil {
 		return nil, err
@@ -420,80 +432,52 @@ func Sentry(natSetting string, port int, sentryAddr string, coreAddr string, sta
 	if err != nil {
 		return err
 	}
-
-	sentryServer.p2pServer, err = p2pServer(ctx, sentryServer, natSetting, port, staticPeers, discovery, netRestrict)
-	if err != nil {
-		return err
-	}
+	sentryServer.natSetting = natSetting
+	sentryServer.port = port
+	sentryServer.staticPeers = staticPeers
+	sentryServer.discovery = discovery
+	sentryServer.netRestrict = netRestrict
 
 	<-ctx.Done()
 	return nil
 }
 
+type StreamMsg struct {
+	b       []byte
+	peerID  string
+	msgName string
+	msgId   proto_sentry.MessageId
+}
+
 type SentryServerImpl struct {
 	proto_sentry.UnimplementedSentryServer
-	peerHeightMap       sync.Map
-	peerRwMap           sync.Map
-	peerTimeMap         sync.Map
-	statusData          *proto_sentry.StatusData
-	p2pServer           *p2p.Server
-	receiveServer       proto_sentry.Sentry_ReceiveMessagesServer
-	receiveUploadServer proto_sentry.Sentry_ReceiveUploadMessagesServer
-	lock                sync.RWMutex
-}
-
-func (ss *SentryServerImpl) forwardMessage(msg p2p.Msg, peerID string, msgName string, msgId proto_sentry.MessageId) error {
-	b := make([]byte, msg.Size)
-	if _, err := io.ReadFull(msg.Payload, b); err != nil {
-		return fmt.Errorf("%s: reading msg into bytes: %v", peerID, err)
-	}
-	receiveServer := ss.getReceiveServer()
-	if receiveServer == nil {
-		log.Error("Sending msg to core, but receiver is nil", "msg", msgName)
-	} else {
-		outreq := proto_sentry.InboundMessage{
-			PeerId: []byte(peerID),
-			Id:     msgId,
-			Data:   b,
-		}
-		if err := receiveServer.Send(&outreq); err != nil {
-			log.Error("Sending msg to core P2P failed", "msg", msgName, "error", err)
-		}
-	}
-	return nil
-}
-
-func (ss *SentryServerImpl) forwardUploadMessage(msg p2p.Msg, peerID string, msgName string, msgId proto_sentry.MessageId) error {
-	b := make([]byte, msg.Size)
-	if _, err := io.ReadFull(msg.Payload, b); err != nil {
-		return fmt.Errorf("%s: reading msg into bytes: %v", peerID, err)
-	}
-	receiveUploadServer := ss.getReceiveUploadServer()
-	if receiveUploadServer == nil {
-		log.Error("Sending msg to core, but receiver is nil", "msg", msgName)
-	} else {
-		outreq := proto_sentry.InboundMessage{
-			PeerId: []byte(peerID),
-			Id:     msgId,
-			Data:   b,
-		}
-		if err := receiveUploadServer.Send(&outreq); err != nil {
-			log.Error("Sending msg to core P2P failed", "msg", msgName, "error", err)
-		}
-	}
-	return nil
+	ctx             context.Context
+	natSetting      string
+	port            int
+	staticPeers     []string
+	discovery       bool
+	netRestrict     string
+	peerHeightMap   sync.Map
+	peerRwMap       sync.Map
+	peerTimeMap     sync.Map
+	statusData      *proto_sentry.StatusData
+	p2pServer       *p2p.Server
+	receiveCh       chan StreamMsg
+	receiveUploadCh chan StreamMsg
+	lock            sync.RWMutex
 }
 
 func (ss *SentryServerImpl) PenalizePeer(_ context.Context, req *proto_sentry.PenalizePeerRequest) (*empty.Empty, error) {
 	//log.Warn("Received penalty", "kind", req.GetPenalty().Descriptor().FullName, "from", fmt.Sprintf("%s", req.GetPeerId()))
-	ss.peerRwMap.Delete(string(req.PeerId))
-	ss.peerTimeMap.Delete(string(req.PeerId))
-	ss.peerHeightMap.Delete(string(req.PeerId))
+	strId := string(gointerfaces.ConvertH512ToBytes(req.PeerId))
+	ss.peerRwMap.Delete(strId)
+	ss.peerTimeMap.Delete(strId)
+	ss.peerHeightMap.Delete(strId)
 	return &empty.Empty{}, nil
 }
 
 func (ss *SentryServerImpl) PeerMinBlock(_ context.Context, req *proto_sentry.PeerMinBlockRequest) (*empty.Empty, error) {
-	peerID := string(req.PeerId)
+	peerID := string(gointerfaces.ConvertH512ToBytes(req.PeerId))
 	x, _ := ss.peerHeightMap.Load(peerID)
 	highestBlock, _ := x.(uint64)
 	if req.MinBlock > highestBlock {
@@ -553,14 +537,14 @@ func (ss *SentryServerImpl) SendMessageByMinBlock(_ context.Context, inreq *prot
 		return &proto_sentry.SentPeers{}, fmt.Errorf("sendMessageByMinBlock to peer %s: %v", peerID, err)
 	}
 	ss.peerTimeMap.Store(peerID, time.Now().Unix()+5)
-	return &proto_sentry.SentPeers{Peers: [][]byte{[]byte(peerID)}}, nil
+	return &proto_sentry.SentPeers{Peers: []*proto_types.H512{gointerfaces.ConvertBytesToH512([]byte(peerID))}}, nil
 }
 
 func (ss *SentryServerImpl) SendMessageById(_ context.Context, inreq *proto_sentry.SendMessageByIdRequest) (*proto_sentry.SentPeers, error) {
-	peerID := string(inreq.PeerId)
+	peerID := string(gointerfaces.ConvertH512ToBytes(inreq.PeerId))
 	rwRaw, ok := ss.peerRwMap.Load(peerID)
 	if !ok {
-		return &proto_sentry.SentPeers{}, fmt.Errorf("peer not found: %x", inreq.PeerId)
+		return &proto_sentry.SentPeers{}, fmt.Errorf("peer not found: %s", inreq.PeerId)
 	}
 	rw, _ := rwRaw.(p2p.MsgReadWriter)
 	var msgcode uint64
@@ -580,7 +564,7 @@ func (ss *SentryServerImpl) SendMessageById(_ context.Context, inreq *proto_sent
 		ss.peerRwMap.Delete(peerID)
 		return &proto_sentry.SentPeers{}, fmt.Errorf("sendMessageById to peer %s: %v", peerID, err)
 	}
-	return &proto_sentry.SentPeers{Peers: [][]byte{inreq.PeerId}}, nil
+	return &proto_sentry.SentPeers{Peers: []*proto_types.H512{inreq.PeerId}}, nil
 }
 
 func (ss *SentryServerImpl) SendMessageToRandomPeers(context.Context, *proto_sentry.SendMessageToRandomPeersRequest) (*proto_sentry.SentPeers, error) {
@@ -596,6 +580,12 @@ func (ss *SentryServerImpl) SetStatus(_ context.Context, statusData *proto_sentr
 	defer ss.lock.Unlock()
 	init := ss.statusData == nil
 	if init {
+		var err error
+		genesisHash := gointerfaces.ConvertH256ToHash(statusData.ForkData.Genesis)
+		ss.p2pServer, err = p2pServer(ss.ctx, ss, genesisHash, ss.natSetting, ss.port, ss.staticPeers, ss.discovery, ss.netRestrict)
+		if err != nil {
+			return &empty.Empty{}, err
+		}
 		// Add protocol
 		if err := ss.p2pServer.Start(); err != nil {
 			return &empty.Empty{}, fmt.Errorf("could not start server: %w", err)
@@ -611,28 +601,75 @@ func (ss *SentryServerImpl) getStatus() *proto_sentry.StatusData {
 	return ss.statusData
 }
 
-func (ss *SentryServerImpl) ReceiveMessages(_ *emptypb.Empty, server proto_sentry.Sentry_ReceiveMessagesServer) error {
+func (ss *SentryServerImpl) receive(msg *StreamMsg) {
 	ss.lock.Lock()
 	defer ss.lock.Unlock()
-	ss.receiveServer = server
+	select {
+	case ss.receiveCh <- *msg:
+	default:
+		// TODO make a warning about dropped messages
+	}
+}
+
+func (ss *SentryServerImpl) recreateReceive() {
+	ss.lock.Lock()
+	defer ss.lock.Unlock()
+	// Close previous channel and recreate
+	close(ss.receiveCh)
+	ss.receiveCh = make(chan StreamMsg, 1024)
+}
+
+func (ss *SentryServerImpl) ReceiveMessages(_ *emptypb.Empty, server proto_sentry.Sentry_ReceiveMessagesServer) error {
+	ss.recreateReceive()
+	for streamMsg := range ss.receiveCh {
+		outreq := proto_sentry.InboundMessage{
+			PeerId: gointerfaces.ConvertBytesToH512([]byte(streamMsg.peerID)),
+			Id:     streamMsg.msgId,
+			Data:   streamMsg.b,
+		}
+		if err := server.Send(&outreq); err != nil {
+			log.Error("Sending msg to core P2P failed", "msg", streamMsg.msgName, "error", err)
+			return err
+		}
+		//fmt.Printf("Sent message %s\n", streamMsg.msgName)
+	}
+	log.Warn("Finished receive messages")
 	return nil
+}
+
+func (ss *SentryServerImpl) receiveUpload(msg *StreamMsg) {
+	ss.lock.Lock()
+	defer ss.lock.Unlock()
+	select {
+	case ss.receiveUploadCh <- *msg:
+	default:
+		// TODO make a warning about dropped messages
+	}
+}
+
+func (ss *SentryServerImpl) recreateReceiveUpload() {
+	ss.lock.Lock()
+	defer ss.lock.Unlock()
+	// Close previous channel and recreate
+	close(ss.receiveUploadCh)
+	ss.receiveUploadCh = make(chan StreamMsg, 1024)
 }
 
 func (ss *SentryServerImpl) ReceiveUploadMessages(_ *emptypb.Empty, server proto_sentry.Sentry_ReceiveUploadMessagesServer) error {
-	ss.lock.Lock()
-	defer ss.lock.Unlock()
-	ss.receiveUploadServer = server
+	// Close previous channel and recreate
+	ss.recreateReceiveUpload()
+	for streamMsg := range ss.receiveUploadCh {
+		outreq := proto_sentry.InboundMessage{
+			PeerId: gointerfaces.ConvertBytesToH512([]byte(streamMsg.peerID)),
+			Id:     streamMsg.msgId,
+			Data:   streamMsg.b,
+		}
+		if err := server.Send(&outreq); err != nil {
+			log.Error("Sending msg to core P2P failed", "msg", streamMsg.msgName, "error", err)
+			return err
+		}
+		//fmt.Printf("Sent upload message %s\n", streamMsg.msgName)
+	}
+	log.Warn("Finished receive upload messages")
 	return nil
-}
-
-func (ss *SentryServerImpl) getReceiveServer() proto_sentry.Sentry_ReceiveMessagesServer {
-	ss.lock.RLock()
-	defer ss.lock.RUnlock()
-	return ss.receiveServer
-}
-
-func (ss *SentryServerImpl) getReceiveUploadServer() proto_sentry.Sentry_ReceiveMessagesServer {
-	ss.lock.RLock()
-	defer ss.lock.RUnlock()
-	return ss.receiveUploadServer
 }

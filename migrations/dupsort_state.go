@@ -32,7 +32,7 @@ var dupSortHashState = Migration{
 
 		if err := etl.Transform(
 			"dupsort_hash_state",
-			db,
+			db.(ethdb.HasTx).Tx().(ethdb.RwTx),
 			dbutils.CurrentStateBucketOld1,
 			dbutils.CurrentStateBucketOld2,
 			tmpdir,
@@ -68,7 +68,7 @@ var dupSortPlainState = Migration{
 
 		if err := etl.Transform(
 			"dupsort_plain_state",
-			db,
+			db.(ethdb.HasTx).Tx().(ethdb.RwTx),
 			dbutils.PlainStateBucketOld1,
 			dbutils.PlainStateBucket,
 			tmpdir,
@@ -233,12 +233,12 @@ var splitHashStateBucket = Migration{
 
 	LoadStep:
 		// Now transaction would have been re-opened, and we should be re-using the space
-		if err = collectorS.Load(logPrefix, db, dbutils.HashedStorageBucket, etl.IdentityLoadFunc, etl.TransformArgs{
+		if err = collectorS.Load(logPrefix, db.(ethdb.HasTx).Tx().(ethdb.RwTx), dbutils.HashedStorageBucket, etl.IdentityLoadFunc, etl.TransformArgs{
 			OnLoadCommit: CommitProgress,
 		}); err != nil {
 			return fmt.Errorf("loading the transformed data back into the storage table: %w", err)
 		}
-		if err = collectorA.Load(logPrefix, db, dbutils.HashedAccountsBucket, etl.IdentityLoadFunc, etl.TransformArgs{
+		if err = collectorA.Load(logPrefix, db.(ethdb.HasTx).Tx().(ethdb.RwTx), dbutils.HashedAccountsBucket, etl.IdentityLoadFunc, etl.TransformArgs{
 			OnLoadCommit: CommitProgress,
 		}); err != nil {
 			return fmt.Errorf("loading the transformed data back into the acc table: %w", err)
@@ -253,7 +253,7 @@ var splitIHBucket = Migration{
 		logPrefix := "db_migration: split_ih_bucket"
 
 		const loadStep = "load"
-		if err := stagedsync.ResetIH(db); err != nil {
+		if err := stagedsync.ResetIH(db.(ethdb.HasTx).Tx().(ethdb.RwTx)); err != nil {
 			return err
 		}
 		if err := CommitProgress(db, []byte(loadStep), false); err != nil {
@@ -277,11 +277,53 @@ var splitIHBucket = Migration{
 		}
 		expectedRootHash := syncHeadHeader.Root
 
-		if err := stagedsync.RegenerateIntermediateHashes(logPrefix, db, true, nil, tmpdir, expectedRootHash, nil); err != nil {
+		if _, err := stagedsync.RegenerateIntermediateHashes(logPrefix, db.(ethdb.HasTx).Tx().(ethdb.RwTx), true, nil, tmpdir, expectedRootHash, nil); err != nil {
 			return err
 		}
 		if err := CommitProgress(db, nil, true); err != nil {
 			return fmt.Errorf("committing the removal of table: %w", err)
+		}
+
+		return nil
+	},
+}
+
+// see https://github.com/ledgerwatch/turbo-geth/pull/1535
+var deleteExtensionHashesFromTrieBucket = Migration{
+	Name: "delete_extension_hashes_from_trie",
+	Up: func(db ethdb.Database, tmpdir string, progress []byte, CommitProgress etl.LoadCommitHandler) error {
+		logPrefix := "db_migration: delete_extension_hashes_from_trie"
+
+		const loadStep = "load"
+		if err := stagedsync.ResetIH(db.(ethdb.HasTx).Tx().(ethdb.RwTx)); err != nil {
+			return err
+		}
+		if err := CommitProgress(db, []byte(loadStep), false); err != nil {
+			return err
+		}
+
+		to, err := stages.GetStageProgress(db, stages.Execution)
+		if err != nil {
+			return err
+		}
+		hash, err := rawdb.ReadCanonicalHash(db, to)
+		if err != nil {
+			return err
+		}
+		syncHeadHeader := rawdb.ReadHeader(db, hash, to)
+		if syncHeadHeader == nil {
+			if err := CommitProgress(db, nil, true); err != nil {
+				return err
+			}
+			return nil
+		}
+		expectedRootHash := syncHeadHeader.Root
+
+		if _, err := stagedsync.RegenerateIntermediateHashes(logPrefix, db.(ethdb.HasTx).Tx().(ethdb.RwTx), true, nil, tmpdir, expectedRootHash, nil); err != nil {
+			return err
+		}
+		if err := CommitProgress(db, nil, true); err != nil {
+			return err
 		}
 
 		return nil

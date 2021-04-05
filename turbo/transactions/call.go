@@ -23,7 +23,7 @@ import (
 
 const callTimeout = 5 * time.Minute
 
-func DoCall(ctx context.Context, args ethapi.CallArgs, tx ethdb.Database, blockNrOrHash rpc.BlockNumberOrHash, overrides *map[common.Address]ethapi.Account, GasCap uint64, chainConfig *params.ChainConfig) (*core.ExecutionResult, error) {
+func DoCall(ctx context.Context, args ethapi.CallArgs, tx ethdb.Tx, blockNrOrHash rpc.BlockNumberOrHash, overrides *map[common.Address]ethapi.Account, GasCap uint64, chainConfig *params.ChainConfig, pending *rpchelper.Pending) (*core.ExecutionResult, error) {
 	// todo: Pending state is only known by the miner
 	/*
 		if blockNrOrHash.BlockNumber != nil && *blockNrOrHash.BlockNumber == rpc.PendingBlockNumber {
@@ -31,19 +31,19 @@ func DoCall(ctx context.Context, args ethapi.CallArgs, tx ethdb.Database, blockN
 			return state, block.Header(), nil
 		}
 	*/
-	blockNumber, hash, err := rpchelper.GetBlockNumber(blockNrOrHash, tx)
+	blockNumber, hash, err := rpchelper.GetBlockNumber(blockNrOrHash, tx, pending)
 	if err != nil {
 		return nil, err
 	}
 	var stateReader state.StateReader
 	if num, ok := blockNrOrHash.Number(); ok && num == rpc.LatestBlockNumber {
-		stateReader = state.NewPlainStateReader(tx)
+		stateReader = state.NewPlainStateReader(ethdb.NewRoTxDb(tx))
 	} else {
-		stateReader = state.NewPlainDBState(tx, blockNumber)
+		stateReader = state.NewPlainDBState(ethdb.NewRoTxDb(tx), blockNumber)
 	}
 	state := state.New(stateReader)
 
-	header := rawdb.ReadHeader(tx, hash, blockNumber)
+	header := rawdb.ReadHeader(ethdb.NewRoTxDb(tx), hash, blockNumber)
 	if header == nil {
 		return nil, fmt.Errorf("block %d(%x) not found", blockNumber, hash)
 	}
@@ -97,9 +97,9 @@ func DoCall(ctx context.Context, args ethapi.CallArgs, tx ethdb.Database, blockN
 	// Get a new instance of the EVM.
 	msg := args.ToMessage(GasCap)
 
-	evmCtx := GetEvmContext(msg, header, blockNrOrHash.RequireCanonical, tx)
+	blockCtx, txCtx := GetEvmContext(msg, header, blockNrOrHash.RequireCanonical, tx)
 
-	evm := vm.NewEVM(evmCtx, state, chainConfig, vm.Config{})
+	evm := vm.NewEVM(blockCtx, txCtx, state, chainConfig, vm.Config{})
 
 	// Wait for the context to be done and cancel the evm. Even if the
 	// EVM has finished, cancelling may be done (repeatedly)
@@ -121,24 +121,26 @@ func DoCall(ctx context.Context, args ethapi.CallArgs, tx ethdb.Database, blockN
 	return result, nil
 }
 
-func GetEvmContext(msg core.Message, header *types.Header, requireCanonical bool, db ethdb.Database) vm.Context {
-	return vm.Context{
-		CanTransfer: core.CanTransfer,
-		Transfer:    core.Transfer,
-		GetHash:     getHashGetter(requireCanonical, db),
-		Origin:      msg.From(),
-		Coinbase:    header.Coinbase,
-		BlockNumber: new(big.Int).Set(header.Number),
-		Time:        new(big.Int).SetUint64(header.Time),
-		Difficulty:  new(big.Int).Set(header.Difficulty),
-		GasLimit:    header.GasLimit,
-		GasPrice:    msg.GasPrice().ToBig(),
-	}
+func GetEvmContext(msg core.Message, header *types.Header, requireCanonical bool, tx ethdb.Tx) (vm.BlockContext, vm.TxContext) {
+	return vm.BlockContext{
+			CanTransfer: core.CanTransfer,
+			Transfer:    core.Transfer,
+			GetHash:     getHashGetter(requireCanonical, tx),
+			Coinbase:    header.Coinbase,
+			BlockNumber: new(big.Int).Set(header.Number),
+			Time:        new(big.Int).SetUint64(header.Time),
+			Difficulty:  new(big.Int).Set(header.Difficulty),
+			GasLimit:    header.GasLimit,
+		},
+		vm.TxContext{
+			Origin:   msg.From(),
+			GasPrice: msg.GasPrice().ToBig(),
+		}
 }
 
-func getHashGetter(requireCanonical bool, db ethdb.Database) func(uint64) common.Hash {
+func getHashGetter(requireCanonical bool, tx ethdb.Tx) func(uint64) common.Hash {
 	return func(n uint64) common.Hash {
-		hash, err := rawdb.ReadCanonicalHash(db, n)
+		hash, err := rawdb.ReadCanonicalHash(ethdb.NewRoTxDb(tx), n)
 		if err != nil {
 			log.Debug("can't get block hash by number", "number", n, "only-canonical", requireCanonical)
 		}

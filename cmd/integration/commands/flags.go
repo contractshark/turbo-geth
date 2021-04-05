@@ -1,6 +1,8 @@
 package commands
 
 import (
+	"github.com/ledgerwatch/turbo-geth/cmd/utils"
+	"github.com/ledgerwatch/turbo-geth/eth/ethconfig"
 	"github.com/ledgerwatch/turbo-geth/node"
 	"github.com/spf13/cobra"
 )
@@ -10,7 +12,6 @@ var (
 	database           string
 	snapshotMode       string
 	snapshotDir        string
-	compact            bool
 	toChaindata        string
 	referenceChaindata string
 	block              uint64
@@ -28,6 +29,7 @@ var (
 	integrityFast      bool
 	silkwormPath       string
 	file               string
+	txtrace            bool // Whether to trace the execution (should only be used together eith `block`)
 )
 
 func must(err error) {
@@ -45,6 +47,18 @@ func withChaindata(cmd *cobra.Command) {
 	cmd.Flags().StringVar(&database, "database", "", "lmdb|mdbx")
 }
 
+func withMining(cmd *cobra.Command) {
+	cmd.Flags().Bool("mine", false, "Enable mining")
+	cmd.Flags().StringArray("miner.notify", nil, "Comma separated HTTP URL list to notify of new work packages")
+	cmd.Flags().Uint64("miner.gastarget", ethconfig.Defaults.Miner.GasFloor, "Target gas floor for mined blocks")
+	cmd.Flags().Uint64("miner.gaslimit", ethconfig.Defaults.Miner.GasCeil, "Target gas ceiling for mined blocks")
+	cmd.Flags().Int64("miner.gasprice", ethconfig.Defaults.Miner.GasPrice.Int64(), "Target gas price for mined blocks")
+	cmd.Flags().String("miner.etherbase", "0", "Public address for block mining rewards (default = first account")
+	cmd.Flags().String("miner.extradata", "", "Block extra data set by the miner (default = client version)")
+	cmd.Flags().Duration("miner.recommit", ethconfig.Defaults.Miner.Recommit, "Time interval to recreate the block being mined")
+	cmd.Flags().Bool("miner.noverify", false, "Disable remote sealing verification")
+}
+
 func withFile(cmd *cobra.Command) {
 	cmd.Flags().StringVar(&file, "file", "", "path to file")
 	must(cmd.MarkFlagFilename("file"))
@@ -54,10 +68,6 @@ func withFile(cmd *cobra.Command) {
 func withLmdbFlags(cmd *cobra.Command) {
 	cmd.Flags().StringVar(&mapSizeStr, "lmdb.mapSize", "", "map size for LMDB")
 	cmd.Flags().IntVar(&freelistReuse, "maxFreelistReuse", 0, "Find a big enough contiguous page range for large values in freelist is hard just allocate new pages and even don't try to search if value is bigger than this limit. Measured in pages.")
-}
-
-func withCompact(cmd *cobra.Command) {
-	cmd.Flags().BoolVar(&compact, "compact", false, "compact db file. if remove much data form LMDB it slows down tx.Commit because it performs `realloc()` of free_list every commit")
 }
 
 func withReferenceChaindata(cmd *cobra.Command) {
@@ -90,6 +100,13 @@ func withBucket(cmd *cobra.Command) {
 	cmd.Flags().StringVar(&bucket, "bucket", "", "reset given stage")
 }
 
+func withDatadir2(cmd *cobra.Command) {
+	cmd.Flags().String(utils.DataDirFlag.Name, utils.DataDirFlag.Value.String(), utils.DataDirFlag.Usage)
+	must(cmd.MarkFlagDirname(utils.DataDirFlag.Name))
+	must(cmd.MarkFlagRequired(utils.DataDirFlag.Name))
+	cmd.Flags().StringVar(&database, "database", "", "lmdb|mdbx")
+}
+
 func withDatadir(cmd *cobra.Command) {
 	cmd.Flags().StringVar(&datadir, "datadir", node.DefaultDataDir(), "data directory for temporary ELT files")
 }
@@ -111,4 +128,8 @@ func withMigration(cmd *cobra.Command) {
 func withSilkworm(cmd *cobra.Command) {
 	cmd.Flags().StringVar(&silkwormPath, "silkworm", "", "file path of libsilkworm_tg_api.so")
 	must(cmd.MarkFlagFilename("silkworm"))
+}
+
+func withTxTrace(cmd *cobra.Command) {
+	cmd.Flags().BoolVar(&txtrace, "txtrace", false, "enable tracing of transactions")
 }

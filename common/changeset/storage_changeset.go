@@ -13,9 +13,8 @@ const (
 )
 
 var (
-	ErrNotFound      = errors.New("not found")
-	errIncorrectData = errors.New("empty prepared data")
-	ErrFindValue     = errors.New("find value error")
+	ErrNotFound  = errors.New("not found")
+	ErrFindValue = errors.New("find value error")
 )
 
 /* Plain changesets (key is a common.Address) */
@@ -47,7 +46,7 @@ func (b StorageChangeSetPlain) FindWithoutIncarnation(blockNumber uint64, addres
 
 // RewindDataPlain generates rewind data for all plain buckets between the timestamp
 // timestapSrc is the current timestamp, and timestamp Dst is where we rewind
-func RewindData(db ethdb.Getter, timestampSrc, timestampDst uint64) (map[string][]byte, map[string][]byte, error) {
+func RewindData(db ethdb.Tx, timestampSrc, timestampDst uint64, quit <-chan struct{}) (map[string][]byte, map[string][]byte, error) {
 	// Collect list of buckets and keys that need to be considered
 	collector := newRewindDataCollector()
 
@@ -55,6 +54,7 @@ func RewindData(db ethdb.Getter, timestampSrc, timestampDst uint64) (map[string]
 		collector.AccountWalker,
 		db, dbutils.PlainAccountChangeSetBucket,
 		timestampDst+1, timestampSrc,
+		quit,
 	); err != nil {
 		return nil, nil, err
 	}
@@ -63,6 +63,7 @@ func RewindData(db ethdb.Getter, timestampSrc, timestampDst uint64) (map[string]
 		collector.StorageWalker,
 		db, dbutils.PlainStorageChangeSetBucket,
 		timestampDst+1, timestampSrc,
+		quit,
 	); err != nil {
 		return nil, nil, err
 	}
@@ -93,9 +94,17 @@ func (c *rewindDataCollector) StorageWalker(k, v []byte) error {
 	return nil
 }
 
-func walkAndCollect(collectorFunc func([]byte, []byte) error, db ethdb.Getter, bucket string, timestampDst, timestampSrc uint64) error {
+func walkAndCollect(collectorFunc func([]byte, []byte) error, db ethdb.Tx, bucket string, timestampDst, timestampSrc uint64, quit <-chan struct{}) error {
 	fromDBFormat := FromDBFormat(Mapper[bucket].KeySize)
-	return db.Walk(bucket, dbutils.EncodeBlockNumber(timestampDst), 0, func(dbKey, dbValue []byte) (bool, error) {
+	c, err := db.Cursor(bucket)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	return ethdb.Walk(c, dbutils.EncodeBlockNumber(timestampDst), 0, func(dbKey, dbValue []byte) (bool, error) {
+		if err := common.Stopped(quit); err != nil {
+			return false, err
+		}
 		timestamp, k, v := fromDBFormat(dbKey, dbValue)
 		if timestamp > timestampSrc {
 			return false, nil

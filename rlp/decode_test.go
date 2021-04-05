@@ -231,20 +231,16 @@ testfor:
 func TestStreamList(t *testing.T) {
 	s := NewStream(bytes.NewReader(unhex("C80102030405060708")), 0)
 
-	len, err := s.List()
-	if err != nil {
+	if len, err := s.List(); err != nil {
 		t.Fatalf("List error: %v", err)
-	}
-	if len != 8 {
+	} else if len != 8 {
 		t.Fatalf("List returned invalid length, got %d, want 8", len)
 	}
 
 	for i := uint64(1); i <= 8; i++ {
-		v, err := s.Uint()
-		if err != nil {
+		if v, err := s.Uint(); err != nil {
 			t.Fatalf("Uint error: %v", err)
-		}
-		if i != v {
+		} else if i != v {
 			t.Errorf("Uint returned wrong value, got %d, want %d", v, i)
 		}
 	}
@@ -252,7 +248,7 @@ func TestStreamList(t *testing.T) {
 	if _, err := s.Uint(); err != EOL {
 		t.Errorf("Uint error mismatch, got %v, want %v", err, EOL)
 	}
-	if err = s.ListEnd(); err != nil {
+	if err := s.ListEnd(); err != nil {
 		t.Fatalf("ListEnd error: %v", err)
 	}
 }
@@ -273,7 +269,9 @@ func TestStreamRaw(t *testing.T) {
 	}
 	for i, tt := range tests {
 		s := NewStream(bytes.NewReader(unhex(tt.input)), 0)
-		s.List()
+		if _, err := s.List(); err != nil {
+			t.Fatal(err)
+		}
 
 		want := unhex(tt.output)
 		raw, err := s.Raw()
@@ -356,7 +354,7 @@ type tailUint struct {
 type tailPrivateFields struct {
 	A    uint
 	Tail []uint `rlp:"tail"`
-	x, y bool   //lint:ignore U1000 unused fields required for testing purposes.
+	x, y bool
 }
 
 type nilListUint struct {
@@ -548,7 +546,7 @@ var decodeTests = []decodeTest{
 	{
 		input: "C3010203",
 		ptr:   new(tailPrivateFields),
-		value: tailPrivateFields{A: 1, Tail: []uint{2, 3}},
+		value: tailPrivateFields{A: 1, Tail: []uint{2, 3}, x: false, y: false},
 	},
 	{
 		input: "C0",
@@ -676,6 +674,26 @@ func TestDecodeWithByteReader(t *testing.T) {
 	runTests(t, func(input []byte, into interface{}) error {
 		return Decode(bytes.NewReader(input), into)
 	})
+}
+
+func testDecodeWithEncReader(t *testing.T, n int) {
+	s := strings.Repeat("0", n)
+	_, r, _ := EncodeToReader(s)
+	var decoded string
+	err := Decode(r, &decoded)
+	if err != nil {
+		t.Errorf("Unexpected decode error with n=%v: %v", n, err)
+	}
+	if decoded != s {
+		t.Errorf("Decode mismatch with n=%v", n)
+	}
+}
+
+// This is a regression test checking that decoding from encReader
+// works for RLP values of size 8192 bytes or more.
+func TestDecodeWithEncReader(t *testing.T) {
+	testDecodeWithEncReader(t, 8188) // length with header is 8191
+	testDecodeWithEncReader(t, 8189) // length with header is 8192
 }
 
 // plainReader reads from a byte slice but does not
@@ -845,7 +863,7 @@ func ExampleDecode_structTagNil() {
 	var normalRules struct {
 		String *string
 	}
-	Decode(bytes.NewReader(input), &normalRules)
+	_ = Decode(bytes.NewReader(input), &normalRules)
 	fmt.Printf("normal: String = %q\n", *normalRules.String)
 
 	// This type uses the struct tag.
@@ -853,7 +871,7 @@ func ExampleDecode_structTagNil() {
 	var withEmptyOK struct {
 		String *string `rlp:"nil"`
 	}
-	Decode(bytes.NewReader(input), &withEmptyOK)
+	_ = Decode(bytes.NewReader(input), &withEmptyOK)
 	fmt.Printf("with nil tag: String = %v\n", withEmptyOK.String)
 
 	// Output:

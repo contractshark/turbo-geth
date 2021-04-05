@@ -14,6 +14,7 @@ import (
 	"github.com/ledgerwatch/turbo-geth/common"
 	"github.com/ledgerwatch/turbo-geth/common/dbutils"
 	"github.com/ledgerwatch/turbo-geth/ethdb"
+	"github.com/ledgerwatch/turbo-geth/ethdb/mdbx"
 	"github.com/ledgerwatch/turbo-geth/log"
 	"github.com/spf13/cobra"
 )
@@ -69,12 +70,40 @@ var cmdCompareStates = &cobra.Command{
 	},
 }
 
-var cmdToMdbx = &cobra.Command{
-	Use:   "to_mdbx",
-	Short: "copy data from '--chaindata' to '--chaindata.reference'",
+var cmdLmdbToMdbx = &cobra.Command{
+	Use:   "lmdb_to_mdbx",
+	Short: "copy data from '--chaindata' to '--chaindata.to'",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := utils.RootContext()
-		err := toMdbx(ctx, chaindata, toChaindata)
+		err := lmdbToMdbx(ctx, chaindata, toChaindata)
+		if err != nil {
+			log.Error(err.Error())
+			return err
+		}
+		return nil
+	},
+}
+
+var cmdLmdbToLmdb = &cobra.Command{
+	Use:   "lmdb_to_lmdb",
+	Short: "copy data from '--chaindata' to '--chaindata.to'",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		ctx := utils.RootContext()
+		err := lmdbToLmdb(ctx, chaindata, toChaindata)
+		if err != nil {
+			log.Error(err.Error())
+			return err
+		}
+		return nil
+	},
+}
+
+var cmdMdbxToMdbx = &cobra.Command{
+	Use:   "mdbx_to_mdbx",
+	Short: "copy data from '--chaindata' to '--chaindata.to'",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		ctx := utils.RootContext()
+		err := mdbxToMdbx(ctx, chaindata, toChaindata)
 		if err != nil {
 			log.Error(err.Error())
 			return err
@@ -85,7 +114,7 @@ var cmdToMdbx = &cobra.Command{
 
 var cmdFToMdbx = &cobra.Command{
 	Use:   "f_to_mdbx",
-	Short: "copy data from '--chaindata' to '--chaindata.reference'",
+	Short: "copy data from '--chaindata' to '--chaindata.to'",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := utils.RootContext()
 		err := fToMdbx(ctx, toChaindata)
@@ -110,11 +139,23 @@ func init() {
 
 	rootCmd.AddCommand(cmdCompareStates)
 
-	withChaindata(cmdToMdbx)
-	withToChaindata(cmdToMdbx)
-	withBucket(cmdToMdbx)
+	withChaindata(cmdLmdbToMdbx)
+	withToChaindata(cmdLmdbToMdbx)
+	withBucket(cmdLmdbToMdbx)
 
-	rootCmd.AddCommand(cmdToMdbx)
+	rootCmd.AddCommand(cmdLmdbToMdbx)
+
+	withChaindata(cmdLmdbToLmdb)
+	withToChaindata(cmdLmdbToLmdb)
+	withBucket(cmdLmdbToLmdb)
+
+	rootCmd.AddCommand(cmdLmdbToLmdb)
+
+	withChaindata(cmdMdbxToMdbx)
+	withToChaindata(cmdMdbxToMdbx)
+	withBucket(cmdMdbxToMdbx)
+
+	rootCmd.AddCommand(cmdMdbxToMdbx)
 
 	withToChaindata(cmdFToMdbx)
 	withFile(cmdFToMdbx)
@@ -130,8 +171,8 @@ func compareStates(ctx context.Context, chaindata string, referenceChaindata str
 	refDB := ethdb.MustOpen(referenceChaindata)
 	defer refDB.Close()
 
-	if err := db.KV().View(context.Background(), func(tx ethdb.Tx) error {
-		if err := refDB.KV().View(context.Background(), func(refTX ethdb.Tx) error {
+	if err := db.RwKV().View(context.Background(), func(tx ethdb.Tx) error {
+		if err := refDB.RwKV().View(context.Background(), func(refTX ethdb.Tx) error {
 			for _, bucket := range stateBuckets {
 				fmt.Printf("\nBucket: %s\n", bucket)
 				if err := compareBuckets(ctx, tx, bucket, refTX, bucket); err != nil {
@@ -156,8 +197,8 @@ func compareBucketBetweenDatabases(ctx context.Context, chaindata string, refere
 	refDB := ethdb.MustOpen(referenceChaindata)
 	defer refDB.Close()
 
-	if err := db.KV().View(context.Background(), func(tx ethdb.Tx) error {
-		return refDB.KV().View(context.Background(), func(refTX ethdb.Tx) error {
+	if err := db.RwKV().View(context.Background(), func(tx ethdb.Tx) error {
+		return refDB.RwKV().View(context.Background(), func(refTX ethdb.Tx) error {
 			return compareBuckets(ctx, tx, bucket, refTX, bucket)
 		})
 	}); err != nil {
@@ -169,12 +210,18 @@ func compareBucketBetweenDatabases(ctx context.Context, chaindata string, refere
 
 func compareBuckets(ctx context.Context, tx ethdb.Tx, b string, refTx ethdb.Tx, refB string) error {
 	count := 0
-	c := tx.Cursor(b)
+	c, err := tx.Cursor(b)
+	if err != nil {
+		return err
+	}
 	k, v, e := c.First()
 	if e != nil {
 		return e
 	}
-	refC := refTx.Cursor(refB)
+	refC, err := refTx.Cursor(refB)
+	if err != nil {
+		return err
+	}
 	refK, refV, revErr := refC.First()
 	if revErr != nil {
 		return revErr
@@ -243,7 +290,7 @@ func fToMdbx(ctx context.Context, to string) error {
 	defer file.Close()
 
 	dst := ethdb.NewMDBX().Path(to).MustOpen()
-	dstTx, err1 := dst.Begin(ctx, ethdb.RW)
+	dstTx, err1 := dst.BeginRw(ctx)
 	if err1 != nil {
 		return err1
 	}
@@ -287,7 +334,10 @@ MainLoop:
 			panic("bucket not parse")
 		}
 
-		c := dstTx.Cursor(bucket)
+		c, err := dstTx.RwCursor(bucket)
+		if err != nil {
+			return err
+		}
 
 		var prevK []byte
 		for {
@@ -305,7 +355,7 @@ MainLoop:
 			v := common.CopyBytes(fileScanner.Bytes())
 			v = common.FromHex(string(v[1:]))
 
-			if casted, ok := c.(ethdb.CursorDupSort); ok {
+			if casted, ok := c.(ethdb.RwCursorDupSort); ok {
 				if bytes.Equal(k, prevK) {
 					if err = casted.AppendDup(k, v); err != nil {
 						panic(err)
@@ -327,14 +377,6 @@ MainLoop:
 				return ctx.Err()
 			case <-commitEvery.C:
 				log.Info("Progress", "bucket", bucket, "key", fmt.Sprintf("%x", k))
-				//if err2 := dstTx.Commit(ctx); err2 != nil {
-				//	return err2
-				//}
-				//dstTx, err = dst.Begin(ctx, nil, ethdb.RW)
-				//if err != nil {
-				//	return err
-				//}
-				//c = dstTx.Cursor(bucket)
 			}
 		}
 		prevK = nil
@@ -343,35 +385,50 @@ MainLoop:
 			panic(err)
 		}
 	}
-	err = dstTx.Commit(context.Background())
+	err = dstTx.Commit()
 	if err != nil {
 		return err
 	}
-	dstTx, err = dst.Begin(ctx, ethdb.RW)
+	dstTx, err = dst.BeginRw(ctx)
 	if err != nil {
 		return err
 	}
-	err = dstTx.Commit(ctx)
+	err = dstTx.Commit()
 	if err != nil {
 		return err
 	}
 
 	return nil
 }
-func toMdbx(ctx context.Context, from, to string) error {
+
+func lmdbToMdbx(ctx context.Context, from, to string) error {
 	_ = os.RemoveAll(to)
-
-	src := ethdb.NewLMDB().Path(from).Flags(func(flags uint) uint {
-		return (flags | lmdb.Readonly) ^ lmdb.NoReadahead
-	}).MustOpen()
+	src := ethdb.NewLMDB().Path(from).Flags(func(flags uint) uint { return (flags | lmdb.Readonly) ^ lmdb.NoReadahead }).MustOpen()
 	dst := ethdb.NewMDBX().Path(to).MustOpen()
+	return kv2kv(ctx, src, dst)
+}
 
-	srcTx, err1 := src.Begin(ctx, ethdb.RO)
+func lmdbToLmdb(ctx context.Context, from, to string) error {
+	_ = os.RemoveAll(to)
+	src := ethdb.NewLMDB().Path(from).Flags(func(flags uint) uint { return (flags | lmdb.Readonly) ^ lmdb.NoReadahead }).MustOpen()
+	dst := ethdb.NewLMDB().Path(to).MustOpen()
+	return kv2kv(ctx, src, dst)
+}
+
+func mdbxToMdbx(ctx context.Context, from, to string) error {
+	_ = os.RemoveAll(to)
+	src := ethdb.NewMDBX().Path(from).Flags(func(flags uint) uint { return mdbx.Readonly | mdbx.Accede }).MustOpen()
+	dst := ethdb.NewMDBX().Path(to).MustOpen()
+	return kv2kv(ctx, src, dst)
+}
+
+func kv2kv(ctx context.Context, src, dst ethdb.RwKV) error {
+	srcTx, err1 := src.BeginRo(ctx)
 	if err1 != nil {
 		return err1
 	}
 	defer srcTx.Rollback()
-	dstTx, err1 := dst.Begin(ctx, ethdb.RW)
+	dstTx, err1 := dst.BeginRw(ctx)
 	if err1 != nil {
 		return err1
 	}
@@ -387,10 +444,16 @@ func toMdbx(ctx context.Context, from, to string) error {
 			continue
 		}
 
-		c := dstTx.Cursor(name)
-		srcC := srcTx.Cursor(name)
+		c, err := dstTx.RwCursor(name)
+		if err != nil {
+			return err
+		}
+		srcC, err := srcTx.Cursor(name)
+		if err != nil {
+			return err
+		}
 		var prevK []byte
-		casted, isDupsort := c.(ethdb.CursorDupSort)
+		casted, isDupsort := c.(ethdb.RwCursorDupSort)
 
 		for k, v, err := srcC.First(); k != nil; k, v, err = srcC.Next() {
 			if err != nil {
@@ -419,15 +482,18 @@ func toMdbx(ctx context.Context, from, to string) error {
 				return ctx.Err()
 			case <-commitEvery.C:
 				log.Info("Progress", "bucket", name, "key", fmt.Sprintf("%x", k))
-				if err2 := dstTx.Commit(ctx); err2 != nil {
+				if err2 := dstTx.Commit(); err2 != nil {
 					return err2
 				}
-				dstTx, err = dst.Begin(ctx, ethdb.RW)
+				dstTx, err = dst.BeginRw(ctx)
 				if err != nil {
 					return err
 				}
-				c = dstTx.Cursor(name)
-				casted, isDupsort = c.(ethdb.CursorDupSort)
+				c, err = dstTx.RwCursor(name)
+				if err != nil {
+					return err
+				}
+				casted, isDupsort = c.(ethdb.RwCursorDupSort)
 			default:
 			}
 		}
@@ -443,19 +509,19 @@ func toMdbx(ctx context.Context, from, to string) error {
 		//	return err
 		//}
 	}
-	err := dstTx.Commit(context.Background())
+	err := dstTx.Commit()
 	if err != nil {
 		return err
 	}
-	dstTx, err = dst.Begin(ctx, ethdb.RW)
+	dstTx, err = dst.BeginRw(ctx)
 	if err != nil {
 		return err
 	}
-	err = dstTx.Commit(ctx)
+	err = dstTx.Commit()
 	if err != nil {
 		return err
 	}
 	srcTx.Rollback()
-	fmt.Printf("done!\n")
+	log.Info("done")
 	return nil
 }

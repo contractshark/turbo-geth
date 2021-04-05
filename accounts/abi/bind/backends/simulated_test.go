@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/holiman/uint256"
+	"github.com/ledgerwatch/turbo-geth/core/rawdb"
 
 	ethereum "github.com/ledgerwatch/turbo-geth"
 	"github.com/ledgerwatch/turbo-geth/accounts/abi"
@@ -44,7 +45,7 @@ import (
 func TestSimulatedBackend(t *testing.T) {
 	var gasLimit uint64 = 8000029
 	key, _ := crypto.GenerateKey() // nolint: gosec
-	auth := bind.NewKeyedTransactor(key)
+	auth, _ := bind.NewKeyedTransactorWithChainID(key, big.NewInt(1337))
 	genAlloc := make(core.GenesisAlloc)
 	genAlloc[auth.From] = core.GenesisAccount{Balance: big.NewInt(9223372036854775807)}
 
@@ -131,7 +132,7 @@ func TestNewSimulatedBackend(t *testing.T) {
 		t.Errorf("expected sim config to equal params.AllEthashProtocolChanges, got %v", sim.config)
 	}
 
-	if sim.blockchain.Config() != params.AllEthashProtocolChanges {
+	if sim.config != params.AllEthashProtocolChanges {
 		t.Errorf("expected sim blockchain config to equal params.AllEthashProtocolChanges, got %v", sim.config)
 	}
 	tx, err1 := sim.DB().Begin(context.Background(), ethdb.RO)
@@ -139,7 +140,8 @@ func TestNewSimulatedBackend(t *testing.T) {
 		t.Errorf("TestNewSimulatedBackend create tx: %v", err1)
 	}
 	defer tx.Rollback()
-	statedb := state.New(state.NewPlainDBState(tx, sim.blockchain.CurrentBlock().NumberU64()))
+
+	statedb := state.New(state.NewPlainDBState(tx, rawdb.ReadCurrentBlock(sim.database).NumberU64()))
 	bal := statedb.GetBalance(testAddr)
 	if !bal.Eq(expectedBal) {
 		t.Errorf("expected balance for test address not received. expected: %v actual: %v", expectedBal, bal)
@@ -425,7 +427,7 @@ func TestSimulatedBackend_EstimateGas(t *testing.T) {
 
 	key, _ := crypto.GenerateKey()
 	addr := crypto.PubkeyToAddress(key.PublicKey)
-	opts := bind.NewKeyedTransactor(key)
+	opts, _ := bind.NewKeyedTransactorWithChainID(key, big.NewInt(1337))
 
 	sim := NewSimulatedBackend(core.GenesisAlloc{addr: {Balance: big.NewInt(params.Ether)}}, 10000000)
 	defer sim.Close()
@@ -629,8 +631,7 @@ func TestSimulatedBackend_HeaderByNumber(t *testing.T) {
 	}
 	if latestBlockHeader == nil {
 		t.Errorf("received a nil block header")
-	}
-	if latestBlockHeader.Number.Uint64() != uint64(0) {
+	} else if latestBlockHeader.Number.Uint64() != uint64(0) {
 		t.Errorf("expected block header number 0, instead got %v", latestBlockHeader.Number.Uint64())
 	}
 
@@ -902,7 +903,7 @@ func TestSimulatedBackend_PendingCodeAt(t *testing.T) {
 	if err != nil {
 		t.Errorf("could not get code at test addr: %v", err)
 	}
-	auth := bind.NewKeyedTransactor(testKey)
+	auth, _ := bind.NewKeyedTransactorWithChainID(testKey, big.NewInt(1337))
 	contractAddr, tx, contract, err := bind.DeployContract(auth, parsed, common.FromHex(abiBin), sim)
 	if err != nil {
 		t.Errorf("could not deploy contract: %v tx: %v contract: %v", err, tx, contract)
@@ -938,7 +939,7 @@ func TestSimulatedBackend_CodeAt(t *testing.T) {
 	if err != nil {
 		t.Errorf("could not get code at test addr: %v", err)
 	}
-	auth := bind.NewKeyedTransactor(testKey)
+	auth, _ := bind.NewKeyedTransactorWithChainID(testKey, big.NewInt(1337))
 	contractAddr, tx, contract, err := bind.DeployContract(auth, parsed, common.FromHex(abiBin), sim)
 	if err != nil {
 		t.Errorf("could not deploy contract: %v tx: %v contract: %v", err, tx, contract)
@@ -970,7 +971,7 @@ func TestSimulatedBackend_PendingAndCallContract(t *testing.T) {
 	if err != nil {
 		t.Errorf("could not get code at test addr: %v", err)
 	}
-	contractAuth := bind.NewKeyedTransactor(testKey)
+	contractAuth, _ := bind.NewKeyedTransactorWithChainID(testKey, big.NewInt(1337))
 	addr, _, _, err := bind.DeployContract(contractAuth, parsed, common.FromHex(abiBin), sim)
 	if err != nil {
 		t.Errorf("could not deploy contract: %v", err)
@@ -1057,7 +1058,7 @@ func TestSimulatedBackend_CallContractRevert(t *testing.T) {
 	if err != nil {
 		t.Errorf("could not get code at test addr: %v", err)
 	}
-	contractAuth := bind.NewKeyedTransactor(testKey)
+	contractAuth, _ := bind.NewKeyedTransactorWithChainID(testKey, big.NewInt(1337))
 	addr, _, _, err := bind.DeployContract(contractAuth, parsed, common.FromHex(reverterBin), sim)
 	if err != nil {
 		t.Errorf("could not deploy contract: %v", err)

@@ -21,12 +21,14 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
-	"github.com/c2h5oh/datasize"
 	"net"
 	"os"
 	"sync"
 	"time"
+
+	"github.com/c2h5oh/datasize"
 
 	"github.com/ledgerwatch/turbo-geth/common"
 	"github.com/ledgerwatch/turbo-geth/common/dbutils"
@@ -62,12 +64,16 @@ const (
 	dbVersion        = 9
 )
 
+var (
+	errInvalidIP = errors.New("invalid IP")
+)
+
 var zeroIP = make(net.IP, 16)
 
 // DB is the node database, storing previously seen nodes and any collected metadata about
 // them for QoS purposes.
 type DB struct {
-	kv     ethdb.KV      // Interface to the database itself
+	kv     ethdb.RwKV    // Interface to the database itself
 	runner sync.Once     // Ensures we can start at most one expirer
 	quit   chan struct{} // Channel to signal the expiring thread to stop
 }
@@ -109,8 +115,11 @@ func newPersistentDB(path string) (*DB, error) {
 	currentVer = currentVer[:binary.PutVarint(currentVer, int64(dbVersion))]
 
 	var blob []byte
-	if err := kv.Update(context.Background(), func(tx ethdb.Tx) error {
-		c := tx.Cursor(dbutils.InodesBucket)
+	if err := kv.Update(context.Background(), func(tx ethdb.RwTx) error {
+		c, err := tx.RwCursor(dbutils.InodesBucket)
+		if err != nil {
+			return err
+		}
 		_, v, errGet := c.SeekExact([]byte(dbVersionKey))
 		if errGet != nil {
 			return errGet
@@ -171,7 +180,7 @@ func splitNodeItemKey(key []byte) (id ID, ip net.IP, field string) {
 	}
 	key = key[len(dbDiscoverRoot)+1:]
 	// Split out the IP.
-	ip = net.IP(key[:16])
+	ip = key[:16]
 	if ip4 := ip.To4(); ip4 != nil {
 		ip = ip4
 	}
@@ -224,8 +233,8 @@ func (db *DB) fetchInt64(key []byte) int64 {
 func (db *DB) storeInt64(key []byte, n int64) error {
 	blob := make([]byte, binary.MaxVarintLen64)
 	blob = blob[:binary.PutVarint(blob, n)]
-	return db.kv.Update(context.Background(), func(tx ethdb.Tx) error {
-		return tx.Cursor(dbutils.InodesBucket).Put(common.CopyBytes(key), blob)
+	return db.kv.Update(context.Background(), func(tx ethdb.RwTx) error {
+		return tx.Put(dbutils.InodesBucket, common.CopyBytes(key), blob)
 	})
 }
 
@@ -251,8 +260,8 @@ func (db *DB) fetchUint64(key []byte) uint64 {
 func (db *DB) storeUint64(key []byte, n uint64) error {
 	blob := make([]byte, binary.MaxVarintLen64)
 	blob = blob[:binary.PutUvarint(blob, n)]
-	return db.kv.Update(context.Background(), func(tx ethdb.Tx) error {
-		return tx.Cursor(dbutils.InodesBucket).Put(common.CopyBytes(key), blob)
+	return db.kv.Update(context.Background(), func(tx ethdb.RwTx) error {
+		return tx.Put(dbutils.InodesBucket, common.CopyBytes(key), blob)
 	})
 }
 
@@ -297,8 +306,8 @@ func (db *DB) UpdateNode(node *Node) error {
 	if err != nil {
 		return err
 	}
-	if err := db.kv.Update(context.Background(), func(tx ethdb.Tx) error {
-		return tx.Cursor(dbutils.InodesBucket).Put(nodeKey(node.ID()), blob)
+	if err := db.kv.Update(context.Background(), func(tx ethdb.RwTx) error {
+		return tx.Put(dbutils.InodesBucket, nodeKey(node.ID()), blob)
 	}); err != nil {
 		return err
 	}
@@ -324,9 +333,12 @@ func (db *DB) DeleteNode(id ID) {
 	deleteRange(db.kv, nodeKey(id))
 }
 
-func deleteRange(db ethdb.KV, prefix []byte) {
-	if err := db.Update(context.Background(), func(tx ethdb.Tx) error {
-		c := tx.Cursor(dbutils.InodesBucket)
+func deleteRange(db ethdb.RwKV, prefix []byte) {
+	if err := db.Update(context.Background(), func(tx ethdb.RwTx) error {
+		c, err := tx.RwCursor(dbutils.InodesBucket)
+		if err != nil {
+			return err
+		}
 		for k, _, err := c.Seek(prefix); bytes.HasPrefix(k, prefix); k, _, err = c.Next() {
 			if err != nil {
 				return err
@@ -378,7 +390,10 @@ func (db *DB) expireNodes() {
 	)
 	var toDelete [][]byte
 	if err := db.kv.View(context.Background(), func(tx ethdb.Tx) error {
-		c := tx.Cursor(dbutils.InodesBucket)
+		c, err := tx.Cursor(dbutils.InodesBucket)
+		if err != nil {
+			return err
+		}
 		p := []byte(dbNodePrefix)
 		var prevId ID
 		var empty = true
@@ -424,16 +439,25 @@ func (db *DB) expireNodes() {
 // LastPingReceived retrieves the time of the last ping packet received from
 // a remote node.
 func (db *DB) LastPingReceived(id ID, ip net.IP) time.Time {
+	if ip = ip.To16(); ip == nil {
+		return time.Time{}
+	}
 	return time.Unix(db.fetchInt64(nodeItemKey(id, ip, dbNodePing)), 0)
 }
 
 // UpdateLastPingReceived updates the last time we tried contacting a remote node.
 func (db *DB) UpdateLastPingReceived(id ID, ip net.IP, instance time.Time) error {
+	if ip = ip.To16(); ip == nil {
+		return errInvalidIP
+	}
 	return db.storeInt64(nodeItemKey(id, ip, dbNodePing), instance.Unix())
 }
 
 // LastPongReceived retrieves the time of the last successful pong from remote node.
 func (db *DB) LastPongReceived(id ID, ip net.IP) time.Time {
+	if ip = ip.To16(); ip == nil {
+		return time.Time{}
+	}
 	// Launch expirer
 	db.ensureExpirer()
 	return time.Unix(db.fetchInt64(nodeItemKey(id, ip, dbNodePong)), 0)
@@ -441,26 +465,41 @@ func (db *DB) LastPongReceived(id ID, ip net.IP) time.Time {
 
 // UpdateLastPongReceived updates the last pong time of a node.
 func (db *DB) UpdateLastPongReceived(id ID, ip net.IP, instance time.Time) error {
+	if ip = ip.To16(); ip == nil {
+		return errInvalidIP
+	}
 	return db.storeInt64(nodeItemKey(id, ip, dbNodePong), instance.Unix())
 }
 
 // FindFails retrieves the number of findnode failures since bonding.
 func (db *DB) FindFails(id ID, ip net.IP) int {
+	if ip = ip.To16(); ip == nil {
+		return 0
+	}
 	return int(db.fetchInt64(nodeItemKey(id, ip, dbNodeFindFails)))
 }
 
 // UpdateFindFails updates the number of findnode failures since bonding.
 func (db *DB) UpdateFindFails(id ID, ip net.IP, fails int) error {
+	if ip = ip.To16(); ip == nil {
+		return errInvalidIP
+	}
 	return db.storeInt64(nodeItemKey(id, ip, dbNodeFindFails), int64(fails))
 }
 
 // FindFailsV5 retrieves the discv5 findnode failure counter.
 func (db *DB) FindFailsV5(id ID, ip net.IP) int {
+	if ip = ip.To16(); ip == nil {
+		return 0
+	}
 	return int(db.fetchInt64(v5Key(id, ip, dbNodeFindFails)))
 }
 
 // UpdateFindFailsV5 stores the discv5 findnode failure counter.
 func (db *DB) UpdateFindFailsV5(id ID, ip net.IP, fails int) error {
+	if ip = ip.To16(); ip == nil {
+		return errInvalidIP
+	}
 	return db.storeInt64(v5Key(id, ip, dbNodeFindFails), int64(fails))
 }
 
@@ -484,7 +523,10 @@ func (db *DB) QuerySeeds(n int, maxAge time.Duration) []*Node {
 	)
 
 	if err := db.kv.View(context.Background(), func(tx ethdb.Tx) error {
-		c := tx.Cursor(dbutils.InodesBucket)
+		c, err := tx.Cursor(dbutils.InodesBucket)
+		if err != nil {
+			return err
+		}
 	seek:
 		for seeks := 0; len(nodes) < n && seeks < n*5; seeks++ {
 			// Seek to a random entry. The first byte is incremented by a

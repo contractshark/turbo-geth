@@ -3,13 +3,14 @@ package commands
 import (
 	"context"
 	"fmt"
+	"os"
+	"time"
+
 	"github.com/ledgerwatch/turbo-geth/common/dbutils"
 	"github.com/ledgerwatch/turbo-geth/ethdb"
 	"github.com/ledgerwatch/turbo-geth/log"
 	"github.com/ledgerwatch/turbo-geth/turbo/snapshotsync"
 	"github.com/spf13/cobra"
-	"os"
-	"time"
 )
 
 func init() {
@@ -37,7 +38,7 @@ func CopyFromState(ctx context.Context, dbpath string, snapshotPath string, bloc
 		return err
 	}
 
-	kv := db.KV()
+	kv := db.RwKV()
 	if snapshotDir != "" {
 		var mode snapshotsync.SnapshotMode
 		mode, err = snapshotsync.SnapshotModeFromString(snapshotMode)
@@ -49,7 +50,7 @@ func CopyFromState(ctx context.Context, dbpath string, snapshotPath string, bloc
 			return err
 		}
 	}
-	db.SetKV(kv)
+	db.SetRwKV(kv)
 
 	err = os.RemoveAll(snapshotPath)
 	if err != nil {
@@ -121,7 +122,7 @@ func CopyFromState(ctx context.Context, dbpath string, snapshotPath string, bloc
 		return err
 	}
 	log.Info("Copy contract code end", "t", time.Since(tt))
-	_, err = sndb.Commit()
+	err = sndb.Commit()
 	if err != nil {
 		return err
 	}
@@ -150,7 +151,7 @@ func CopyFromState(ctx context.Context, dbpath string, snapshotPath string, bloc
 		return err
 	}
 	log.Info("Copy code end", "t", time.Since(tt))
-	_, err = sndb.Commit()
+	err = sndb.Commit()
 	if err != nil {
 		return err
 	}

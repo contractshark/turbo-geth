@@ -89,10 +89,34 @@ func (h Hash) String() string {
 	return h.Hex()
 }
 
-// Format implements fmt.Formatter, forcing the byte slice to be formatted as is,
-// without going through the stringer interface used for logging.
+// Format implements fmt.Formatter.
+// Hash supports the %v, %s, %v, %x, %X and %d format verbs.
 func (h Hash) Format(s fmt.State, c rune) {
-	fmt.Fprintf(s, "%"+string(c), h[:])
+	hexb := make([]byte, 2+len(h)*2)
+	copy(hexb, "0x")
+	hex.Encode(hexb[2:], h[:])
+
+	switch c {
+	case 'x', 'X':
+		if !s.Flag('#') {
+			hexb = hexb[2:]
+		}
+		if c == 'X' {
+			hexb = bytes.ToUpper(hexb)
+		}
+		fallthrough
+	case 'v', 's':
+		s.Write(hexb)
+	case 'q':
+		q := []byte{'"'}
+		s.Write(q)
+		s.Write(hexb)
+		s.Write(q)
+	case 'd':
+		fmt.Fprint(s, ([len(h)]byte)(h))
+	default:
+		fmt.Fprintf(s, "%%!%c(hash=%x)", c, h)
+	}
 }
 
 // UnmarshalText parses a hash in hex syntax.
@@ -147,21 +171,6 @@ func (h Hash) Value() (driver.Value, error) {
 	return h[:], nil
 }
 
-// ImplementsGraphQLType returns true if Hash implements the specified GraphQL type.
-func (Hash) ImplementsGraphQLType(name string) bool { return name == "Bytes32" }
-
-// UnmarshalGraphQL unmarshals the provided GraphQL query data.
-func (h *Hash) UnmarshalGraphQL(input interface{}) error {
-	var err error
-	switch input := input.(type) {
-	case string:
-		err = h.UnmarshalText([]byte(input))
-	default:
-		err = fmt.Errorf("unexpected type %T for Hash", input)
-	}
-	return err
-}
-
 // UnprefixedHash allows marshaling a Hash without 0x prefix.
 type UnprefixedHash Hash
 
@@ -213,24 +222,7 @@ func (a Address) Hash() Hash { return BytesToHash(a[:]) }
 
 // Hex returns an EIP55-compliant hex string representation of the address.
 func (a Address) Hex() string {
-	unchecksummed := hex.EncodeToString(a[:])
-	sha := sha3.NewLegacyKeccak256()
-	sha.Write([]byte(unchecksummed))
-	hash := sha.Sum(nil)
-
-	result := []byte(unchecksummed)
-	for i := 0; i < len(result); i++ {
-		hashByte := hash[i/2]
-		if i%2 == 0 {
-			hashByte = hashByte >> 4
-		} else {
-			hashByte &= 0xf
-		}
-		if result[i] > '9' && hashByte > 7 {
-			result[i] -= 32
-		}
-	}
-	return "0x" + string(result)
+	return string(a.checksumHex())
 }
 
 // String implements fmt.Stringer.
@@ -238,14 +230,65 @@ func (a Address) String() string {
 	return a.Hex()
 }
 
-// Format implements fmt.Formatter, forcing the byte slice to be formatted as is,
-// without going through the stringer interface used for logging.
+func (a *Address) checksumHex() []byte {
+	buf := a.hex()
+
+	// compute checksum
+	sha := sha3.NewLegacyKeccak256()
+	//nolint:errcheck
+	sha.Write(buf[2:])
+	hash := sha.Sum(nil)
+	for i := 2; i < len(buf); i++ {
+		hashByte := hash[(i-2)/2]
+		if i%2 == 0 {
+			hashByte = hashByte >> 4
+		} else {
+			hashByte &= 0xf
+		}
+		if buf[i] > '9' && hashByte > 7 {
+			buf[i] -= 32
+		}
+	}
+	return buf[:]
+}
+
+func (a Address) hex() []byte {
+	var buf [len(a)*2 + 2]byte
+	copy(buf[:2], "0x")
+	hex.Encode(buf[2:], a[:])
+	return buf[:]
+}
+
+// Format implements fmt.Formatter.
+// Address supports the %v, %s, %v, %x, %X and %d format verbs.
 func (a Address) Format(s fmt.State, c rune) {
-	fmt.Fprintf(s, "%"+string(c), a[:])
+	switch c {
+	case 'v', 's':
+		s.Write(a.checksumHex())
+	case 'q':
+		q := []byte{'"'}
+		s.Write(q)
+		s.Write(a.checksumHex())
+		s.Write(q)
+	case 'x', 'X':
+		// %x disables the checksum.
+		hex := a.hex()
+		if !s.Flag('#') {
+			hex = hex[2:]
+		}
+		if c == 'X' {
+			hex = bytes.ToUpper(hex)
+		}
+		s.Write(hex)
+	case 'd':
+		fmt.Fprint(s, ([len(a)]byte)(a))
+	default:
+		fmt.Fprintf(s, "%%!%c(address=%x)", c, a)
+	}
 }
 
 // SetBytes sets the address to the value of b.
-// If b is larger than len(a) it will panic.
+// If b is larger than len(a), b will be cropped from the left.
 func (a *Address) SetBytes(b []byte) {
 	if len(b) > len(a) {
 		b = b[len(b)-AddressLength:]
@@ -284,21 +327,6 @@ func (a *Address) Scan(src interface{}) error {
 // Value implements valuer for database/sql.
 func (a Address) Value() (driver.Value, error) {
 	return a[:], nil
-}
-
-// ImplementsGraphQLType returns true if Hash implements the specified GraphQL type.
-func (a Address) ImplementsGraphQLType(name string) bool { return name == "Address" }
-
-// UnmarshalGraphQL unmarshals the provided GraphQL query data.
-func (a *Address) UnmarshalGraphQL(input interface{}) error {
-	var err error
-	switch input := input.(type) {
-	case string:
-		err = a.UnmarshalText([]byte(input))
-	default:
-		err = fmt.Errorf("unexpected type %T for Address", input)
-	}
-	return err
 }
 
 // UnprefixedAddress allows marshaling an Address without 0x prefix.

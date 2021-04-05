@@ -13,6 +13,7 @@ import (
 	"github.com/ledgerwatch/turbo-geth/common/dbutils"
 	"github.com/ledgerwatch/turbo-geth/ethdb"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 const (
@@ -217,16 +218,17 @@ func TestEncodingStorageNewWithoutNotDefaultIncarnationFindPlain(t *testing.T) {
 	m := Mapper[bkt]
 	db := ethdb.NewMemDatabase()
 	defer db.Close()
-	tx, err := db.KV().Begin(context.Background(), ethdb.RW)
-	if err != nil {
-		t.Fatal(err)
-	}
+	tx, err := db.RwKV().BeginRw(context.Background())
+	require.NoError(t, err)
 	defer tx.Rollback()
 
-	cs := m.WalkerAdapter(tx.CursorDupSort(bkt)).(StorageChangeSetPlain)
+	c, err := tx.CursorDupSort(bkt)
+	require.NoError(t, err)
+	cs := m.WalkerAdapter(c).(StorageChangeSetPlain)
 
 	clear := func() {
-		c := tx.Cursor(bkt)
+		c, err := tx.RwCursor(bkt)
+		require.NoError(t, err)
 		defer c.Close()
 		for k, _, err := c.First(); k != nil; k, _, err = c.First() {
 			if err != nil {
@@ -247,16 +249,17 @@ func TestEncodingStorageNewWithoutNotDefaultIncarnationFindWithoutIncarnationPla
 	m := Mapper[bkt]
 	db := ethdb.NewMemDatabase()
 	defer db.Close()
-	tx, err := db.KV().Begin(context.Background(), ethdb.RW)
-	if err != nil {
-		t.Fatal(err)
-	}
+	tx, err := db.RwKV().BeginRw(context.Background())
+	require.NoError(t, err)
 	defer tx.Rollback()
 
-	cs := m.WalkerAdapter(tx.CursorDupSort(bkt)).(StorageChangeSetPlain)
+	c, err := tx.CursorDupSort(bkt)
+	require.NoError(t, err)
+	cs := m.WalkerAdapter(c).(StorageChangeSetPlain)
 
 	clear := func() {
-		c := tx.Cursor(bkt)
+		c, err := tx.RwCursor(bkt)
+		require.NoError(t, err)
 		defer c.Close()
 		for k, _, err := c.First(); k != nil; k, _, err = c.First() {
 			if err != nil {
@@ -284,7 +287,7 @@ func findWithoutIncarnationFunc(f func(blockNumber uint64, addrHashToFind []byte
 
 func doTestFind(
 	t *testing.T,
-	tx ethdb.Tx,
+	tx ethdb.RwTx,
 	bucket string,
 	generator func(common.Address, uint64, common.Hash) []byte,
 	newFunc func() *ChangeSet,
@@ -308,9 +311,10 @@ func doTestFind(
 			}
 		}
 
-		c := tx.Cursor(bucket)
+		c, err := tx.RwCursor(bucket)
+		require.NoError(t, err)
 
-		err := encodeFunc(1, ch, func(k, v []byte) error {
+		err = encodeFunc(1, ch, func(k, v []byte) error {
 			if err2 := c.Put(common.CopyBytes(k), common.CopyBytes(v)); err2 != nil {
 				return err2
 			}
@@ -411,13 +415,13 @@ func TestMultipleIncarnationsOfTheSameContract(t *testing.T) {
 	m := Mapper[bkt]
 	db := ethdb.NewMemDatabase()
 	defer db.Close()
-	tx, err := db.KV().Begin(context.Background(), ethdb.RW)
-	if err != nil {
-		t.Fatal(err)
-	}
+	tx, err := db.RwKV().BeginRw(context.Background())
+	require.NoError(t, err)
 	defer tx.Rollback()
 
-	cs := m.WalkerAdapter(tx.CursorDupSort(bkt)).(StorageChangeSetPlain)
+	c1, err := tx.CursorDupSort(bkt)
+	require.NoError(t, err)
+	cs := m.WalkerAdapter(c1).(StorageChangeSetPlain)
 
 	contractA := common.HexToAddress("0x6f0e0cdac6c716a00bd8db4d0eee4f2bfccf8e6a")
 	contractB := common.HexToAddress("0xc5acb79c258108f288288bc26f7820d06f45f08c")
@@ -439,7 +443,8 @@ func TestMultipleIncarnationsOfTheSameContract(t *testing.T) {
 	val5 := common.FromHex("0x0000000000000000000000000000000000000000000000000000000000000000")
 	val6 := common.FromHex("0xec89478783348038046b42cc126a3c4e351977b5f4cf5e3c4f4d8385adbf8046")
 
-	c := tx.CursorDupSort(bkt)
+	c, err := tx.RwCursorDupSort(bkt)
+	require.NoError(t, err)
 
 	ch := NewStorageChangeSetPlain()
 	assert.NoError(t, ch.Add(dbutils.PlainGenerateCompositeStorageKey(contractA.Bytes(), 2, key1.Bytes()), val1))

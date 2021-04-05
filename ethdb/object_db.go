@@ -22,7 +22,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/google/btree"
 	"github.com/ledgerwatch/lmdb-go/lmdb"
@@ -30,12 +29,6 @@ import (
 	"github.com/ledgerwatch/turbo-geth/common/dbutils"
 	"github.com/ledgerwatch/turbo-geth/common/debug"
 	"github.com/ledgerwatch/turbo-geth/log"
-	"github.com/ledgerwatch/turbo-geth/metrics"
-)
-
-var (
-	dbGetTimer = metrics.NewRegisteredTimer("db/get", nil)
-	dbPutTimer = metrics.NewRegisteredTimer("db/put", nil)
 )
 
 type DbCopier interface {
@@ -44,23 +37,22 @@ type DbCopier interface {
 
 // ObjectDatabase - is an object-style interface of DB accessing
 type ObjectDatabase struct {
-	kv  KV
-	log log.Logger
-	id  uint64
+	kv RwKV
 }
 
 // NewObjectDatabase returns a AbstractDB wrapper.
-func NewObjectDatabase(kv KV) *ObjectDatabase {
-	logger := log.New("database", "object")
+func NewObjectDatabase(kv RwKV) *ObjectDatabase {
 	return &ObjectDatabase{
-		kv:  kv,
-		log: logger,
-		id:  id(),
+		kv: kv,
 	}
 }
 
 func MustOpen(path string) *ObjectDatabase {
-	db, err := Open(path, false)
+	return NewObjectDatabase(MustOpenKV(path))
+}
+
+func MustOpenKV(path string) RwKV {
+	db, err := OpenKV(path, false)
 	if err != nil {
 		panic(err)
 	}
@@ -69,8 +61,8 @@ func MustOpen(path string) *ObjectDatabase {
 
 // Open - main method to open database. Choosing driver based on path suffix.
 // If env TEST_DB provided - choose driver based on it. Some test using this method to open non-in-memory db
-func Open(path string, readOnly bool) (*ObjectDatabase, error) {
-	var kv KV
+func OpenKV(path string, readOnly bool) (RwKV, error) {
+	var kv RwKV
 	var err error
 	testDB := debug.TestDB()
 	switch true {
@@ -89,36 +81,53 @@ func Open(path string, readOnly bool) (*ObjectDatabase, error) {
 	if err != nil {
 		return nil, err
 	}
+	return kv, nil
+}
+
+func Open(path string, readOnly bool) (*ObjectDatabase, error) {
+	kv, kvErr := OpenKV(path, readOnly)
+	if kvErr != nil {
+		return nil, kvErr
+	}
+
 	return NewObjectDatabase(kv), nil
 }
 
 // Put inserts or updates a single entry.
 func (db *ObjectDatabase) Put(bucket string, key []byte, value []byte) error {
-	err := db.kv.Update(context.Background(), func(tx Tx) error {
-		return tx.Cursor(bucket).Put(key, value)
+	err := db.kv.Update(context.Background(), func(tx RwTx) error {
+		return tx.Put(bucket, key, value)
 	})
 	return err
 }
 
 // Append appends a single entry to the end of the bucket.
 func (db *ObjectDatabase) Append(bucket string, key []byte, value []byte) error {
-	err := db.kv.Update(context.Background(), func(tx Tx) error {
-		return tx.Cursor(bucket).Append(key, value)
+	err := db.kv.Update(context.Background(), func(tx RwTx) error {
+		c, err := tx.RwCursor(bucket)
+		if err != nil {
+			return err
+		}
+		return c.Append(key, value)
 	})
 	return err
 }
 
 // AppendDup appends a single entry to the end of the bucket.
 func (db *ObjectDatabase) AppendDup(bucket string, key []byte, value []byte) error {
-	err := db.kv.Update(context.Background(), func(tx Tx) error {
-		return tx.CursorDupSort(bucket).AppendDup(key, value)
+	err := db.kv.Update(context.Background(), func(tx RwTx) error {
+		c, err := tx.RwCursorDupSort(bucket)
+		if err != nil {
+			return err
+		}
+		return c.AppendDup(key, value)
 	})
 	return err
 }
 
 // MultiPut - requirements: input must be sorted and without duplicates
 func (db *ObjectDatabase) MultiPut(tuples ...[]byte) (uint64, error) {
-	err := db.kv.Update(context.Background(), func(tx Tx) error {
+	err := db.kv.Update(context.Background(), func(tx RwTx) error {
 		return MultiPut(tx, tuples...)
 	})
 	if err != nil {
@@ -148,16 +157,16 @@ func (db *ObjectDatabase) DiskSize(ctx context.Context) (uint64, error) {
 	return casted.DiskSize(ctx)
 }
 
-func (db *ObjectDatabase) Sequence(bucket string, amount uint64) (res uint64, err error) {
-	if amount == 0 {
-		err = db.kv.View(context.Background(), func(tx Tx) error {
-			res, err = tx.Sequence(bucket, amount)
-			return err
-		})
-		return res, err
-	}
-	err = db.kv.Update(context.Background(), func(tx Tx) error {
-		res, err = tx.Sequence(bucket, amount)
+func (db *ObjectDatabase) IncrementSequence(bucket string, amount uint64) (res uint64, err error) {
+	err = db.kv.Update(context.Background(), func(tx RwTx) error {
+		res, err = tx.IncrementSequence(bucket, amount)
+		return err
+	})
+	return res, err
+}
+func (db *ObjectDatabase) ReadSequence(bucket string) (res uint64, err error) {
+	err = db.kv.View(context.Background(), func(tx Tx) error {
+		res, err = tx.ReadSequence(bucket)
 		return err
 	})
 	return res, err
@@ -188,7 +197,11 @@ func (db *ObjectDatabase) Get(bucket string, key []byte) ([]byte, error) {
 func (db *ObjectDatabase) Last(bucket string) ([]byte, []byte, error) {
 	var key, value []byte
 	if err := db.kv.View(context.Background(), func(tx Tx) error {
-		k, v, err := tx.Cursor(bucket).Last()
+		c, err := tx.Cursor(bucket)
+		if err != nil {
+			return err
+		}
+		k, v, err := c.Last()
 		if err != nil {
 			return err
 		}
@@ -202,47 +215,22 @@ func (db *ObjectDatabase) Last(bucket string) ([]byte, []byte, error) {
 	return key, value, nil
 }
 
-// GetIndexChunk returns proper index chunk or return error if index is not created.
-// key must contain inverted block number in the end
-func (db *ObjectDatabase) GetIndexChunk(bucket string, key []byte, timestamp uint64) ([]byte, error) {
-	var dat []byte
+func (db *ObjectDatabase) Walk(bucket string, startkey []byte, fixedbits int, walker func(k, v []byte) (bool, error)) error {
 	err := db.kv.View(context.Background(), func(tx Tx) error {
-		c := tx.Cursor(bucket)
-		k, v, err := c.Seek(dbutils.IndexChunkKey(key, timestamp))
+		c, err := tx.Cursor(bucket)
 		if err != nil {
 			return err
 		}
-		if !bytes.HasPrefix(k, dbutils.CompositeKeyWithoutIncarnation(key)) {
-			return ErrKeyNotFound
-		}
-		dat = make([]byte, len(v))
-		copy(dat, v)
-		return nil
-	})
-	if dat == nil {
-		return nil, ErrKeyNotFound
-	}
-	return dat, err
-}
-
-func (db *ObjectDatabase) Walk(bucket string, startkey []byte, fixedbits int, walker func(k, v []byte) (bool, error)) error {
-	err := db.kv.View(context.Background(), func(tx Tx) error {
-		return Walk(tx.Cursor(bucket), startkey, fixedbits, walker)
+		return Walk(c, startkey, fixedbits, walker)
 	})
 	return err
-}
-
-func (db *ObjectDatabase) MultiWalk(bucket string, startkeys [][]byte, fixedbits []int, walker func(int, []byte, []byte) error) error {
-	return db.kv.View(context.Background(), func(tx Tx) error {
-		return MultiWalk(tx.Cursor(bucket), startkeys, fixedbits, walker)
-	})
 }
 
 // Delete deletes the key from the queue and database
 func (db *ObjectDatabase) Delete(bucket string, k, v []byte) error {
 	// Execute the actual operation
-	err := db.kv.Update(context.Background(), func(tx Tx) error {
-		return tx.Cursor(bucket).Delete(k, v)
+	err := db.kv.Update(context.Background(), func(tx RwTx) error {
+		return tx.Delete(bucket, k, v)
 	})
 	return err
 }
@@ -265,7 +253,7 @@ func (db *ObjectDatabase) BucketExists(name string) (bool, error) {
 func (db *ObjectDatabase) ClearBuckets(buckets ...string) error {
 	for i := range buckets {
 		name := buckets[i]
-		if err := db.kv.Update(context.Background(), func(tx Tx) error {
+		if err := db.kv.Update(context.Background(), func(tx RwTx) error {
 			migrator, ok := tx.(BucketMigrator)
 			if !ok {
 				return fmt.Errorf("%T doesn't implement ethdb.TxMigrator interface", db.kv)
@@ -286,7 +274,7 @@ func (db *ObjectDatabase) DropBuckets(buckets ...string) error {
 	for i := range buckets {
 		name := buckets[i]
 		log.Info("Dropping bucket", "name", name)
-		if err := db.kv.Update(context.Background(), func(tx Tx) error {
+		if err := db.kv.Update(context.Background(), func(tx RwTx) error {
 			migrator, ok := tx.(BucketMigrator)
 			if !ok {
 				return fmt.Errorf("%T doesn't implement ethdb.TxMigrator interface", db.kv)
@@ -312,12 +300,19 @@ func (db *ObjectDatabase) Keys() ([][]byte, error) {
 		for _, name := range dbutils.Buckets {
 			var nameCopy = make([]byte, len(name))
 			copy(nameCopy, name)
-			return ForEach(tx.Cursor(name), func(k, _ []byte) (bool, error) {
+			c, err := tx.Cursor(name)
+			if err != nil {
+				return err
+			}
+			err = ForEach(c, func(k, _ []byte) (bool, error) {
 				var kCopy = make([]byte, len(k))
 				copy(kCopy, k)
 				keys = append(append(keys, nameCopy), kCopy)
 				return true, nil
 			})
+			if err != nil {
+				return err
+			}
 		}
 		return nil
 	})
@@ -327,11 +322,11 @@ func (db *ObjectDatabase) Keys() ([][]byte, error) {
 	return keys, err
 }
 
-func (db *ObjectDatabase) KV() KV {
+func (db *ObjectDatabase) RwKV() RwKV {
 	return db.kv
 }
 
-func (db *ObjectDatabase) SetKV(kv KV) {
+func (db *ObjectDatabase) SetRwKV(kv RwKV) {
 	db.kv = kv
 }
 
@@ -348,10 +343,16 @@ func (db *ObjectDatabase) MemCopy() *ObjectDatabase {
 	if err := db.kv.View(context.Background(), func(readTx Tx) error {
 		for _, name := range dbutils.Buckets {
 			name := name
-			if err := mem.kv.Update(context.Background(), func(writeTx Tx) error {
-				newBucketToWrite := writeTx.Cursor(name)
+			if err := mem.kv.Update(context.Background(), func(writeTx RwTx) error {
+				newBucketToWrite, err := writeTx.RwCursor(name)
+				if err != nil {
+					return err
+				}
 				defer newBucketToWrite.Close()
-				readC := readTx.Cursor(name)
+				readC, err := readTx.Cursor(name)
+				if err != nil {
+					return err
+				}
 				defer readC.Close()
 				return ForEach(readC, func(k, v []byte) (bool, error) {
 					if err := newBucketToWrite.Put(common.CopyBytes(k), common.CopyBytes(v)); err != nil {
@@ -379,32 +380,20 @@ func (db *ObjectDatabase) NewBatch() DbWithPendingMutations {
 	return m
 }
 
-func (db *ObjectDatabase) Begin(ctx context.Context, flags TxFlags) (DbWithPendingMutations, error) {
+func (db *ObjectDatabase) BeginGetter(ctx context.Context) (GetterTx, error) {
 	batch := &TxDb{db: db}
-	if err := batch.begin(ctx, flags); err != nil {
-		panic(err)
+	if err := batch.begin(ctx, RO); err != nil {
+		return batch, err
 	}
 	return batch, nil
 }
 
-// IdealBatchSize defines the size of the data batches should ideally add in one write.
-func (db *ObjectDatabase) IdealBatchSize() int {
-	panic("only mutation hast preferred batch size, because it limited by RAM")
-}
-
-// [TURBO-GETH] Freezer support (not implemented yet)
-// Ancients returns an error as we don't have a backing chain freezer.
-func (db *ObjectDatabase) Ancients() (uint64, error) {
-	return 0, errNotSupported
-}
-
-// TruncateAncients returns an error as we don't have a backing chain freezer.
-func (db *ObjectDatabase) TruncateAncients(items uint64) error {
-	return errNotSupported
-}
-
-func (db *ObjectDatabase) Reserve(bucket string, key []byte, i int) ([]byte, error) {
-	panic("supported only by TxDb")
+func (db *ObjectDatabase) Begin(ctx context.Context, flags TxFlags) (DbWithPendingMutations, error) {
+	batch := &TxDb{db: db}
+	if err := batch.begin(ctx, flags); err != nil {
+		return batch, err
+	}
+	return batch, nil
 }
 
 // Type which expecting sequence of triplets: dbi, key, value, ....
@@ -432,23 +421,6 @@ func (t MultiPutTuples) Swap(i, j int) {
 	t[i3+2], t[j3+2] = t[j3+2], t[i3+2]
 }
 
-func Get(tx Tx, bucket string, key []byte) ([]byte, error) {
-	// Retrieve the key and increment the miss counter if not found
-	var dat []byte
-	v, err := tx.GetOne(bucket, key)
-	if err != nil {
-		return nil, err
-	}
-	if v != nil {
-		dat = make([]byte, len(v))
-		copy(dat, v)
-	}
-	if dat == nil {
-		return nil, ErrKeyNotFound
-	}
-	return dat, err
-}
-
 func Bytesmask(fixedbits int) (fixedbytes int, mask byte) {
 	fixedbytes = (fixedbits + 7) / 8
 	shiftbits := fixedbits & 7
@@ -468,29 +440,4 @@ func InspectDatabase(db Database) error {
 func NewDatabaseWithFreezer(db *ObjectDatabase, dir, suffix string) (*ObjectDatabase, error) {
 	// FIXME: implement freezer in Turbo-Geth
 	return db, nil
-}
-
-func WarmUp(tx Tx, bucket string, logEvery *time.Ticker, quit <-chan struct{}) error {
-	count := 0
-	c := tx.Cursor(bucket)
-	totalKeys, errCount := c.Count()
-	if errCount != nil {
-		return errCount
-	}
-	for k, _, err := c.First(); k != nil; k, _, err = c.Next() {
-		if err != nil {
-			return err
-		}
-		count++
-
-		select {
-		default:
-		case <-quit:
-			return common.ErrStopped
-		case <-logEvery.C:
-			log.Info("Warmed up state", "progress", fmt.Sprintf("%.2fM/%.2fM", float64(count)/1_000_000, float64(totalKeys)/1_000_000))
-		}
-	}
-
-	return nil
 }

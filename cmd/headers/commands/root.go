@@ -16,7 +16,6 @@ import (
 )
 
 var (
-	filesDir      string // Directory when the files should be stored
 	sentryAddr    string // Address of the sentry <host>:<port>
 	coreAddr      string // Address of the core <host>:<port>
 	chaindata     string // Path to chaindata
@@ -90,7 +89,7 @@ func openDatabase(path string) *ethdb.ObjectDatabase {
 	return db
 }
 
-func openKV(path string, exclusive bool) ethdb.KV {
+func openKV(path string, exclusive bool) ethdb.RwKV {
 	if database == "mdbx" {
 		opts := ethdb.NewMDBX().Path(path)
 		if exclusive {

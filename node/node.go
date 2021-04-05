@@ -27,9 +27,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/ledgerwatch/turbo-geth/accounts"
 	"github.com/ledgerwatch/turbo-geth/ethdb"
-	"github.com/ledgerwatch/turbo-geth/event"
 	"github.com/ledgerwatch/turbo-geth/log"
 	"github.com/ledgerwatch/turbo-geth/migrations"
 	"github.com/ledgerwatch/turbo-geth/p2p"
@@ -39,11 +37,8 @@ import (
 
 // Node is a container on which services can be registered.
 type Node struct {
-	eventmux      *event.TypeMux
 	config        *Config
-	accman        *accounts.Manager
 	log           log.Logger
-	ephemKeystore string            // if non-empty, the key directory that will be removed by Stop
 	dirLock       fileutil.Releaser // prevents concurrent use of instance directory
 	stop          chan struct{}     // Channel to wait for termination notifications
 	server        *p2p.Server       // Currently running P2P networking layer
@@ -91,9 +86,6 @@ func New(conf *Config) (*Node, error) {
 	if strings.ContainsAny(conf.Name, `/\`) {
 		return nil, errors.New(`Config.Name must not contain '/' or '\'`)
 	}
-	if conf.Name == datadirDefaultKeyStore {
-		return nil, errors.New(`Config.Name cannot be "` + datadirDefaultKeyStore + `"`)
-	}
 	if strings.HasSuffix(conf.Name, ".ipc") {
 		return nil, errors.New(`Config.Name cannot end in ".ipc"`)
 	}
@@ -101,7 +93,6 @@ func New(conf *Config) (*Node, error) {
 	node := &Node{
 		config:        conf,
 		inprocHandler: rpc.NewServer(),
-		eventmux:      new(event.TypeMux),
 		log:           conf.Logger,
 		stop:          make(chan struct{}),
 		server:        &p2p.Server{Config: conf.P2P},
@@ -115,15 +106,8 @@ func New(conf *Config) (*Node, error) {
 	if err := node.openDataDir(); err != nil {
 		return nil, err
 	}
-	// Ensure that the AccountManager method works before the node has started. We rely on
-	// this in cmd/geth.
-	am, ephemeralKeystore, err := makeAccountManager(conf)
-	if err != nil {
-		return nil, err
-	}
-	node.accman = am
-	node.ephemKeystore = ephemeralKeystore
 
+	var err error
 	// Initialize the p2p server. This creates the node key and discovery databases.
 	node.server.Config.PrivateKey, err = node.config.NodeKey()
 	if err != nil {
@@ -148,6 +132,14 @@ func New(conf *Config) (*Node, error) {
 		if err != nil {
 			return nil, err
 		}
+	}
+
+	// Check HTTP/WS prefixes are valid.
+	if err := validatePrefix("HTTP", conf.HTTPPathPrefix); err != nil {
+		return nil, err
+	}
+	if err := validatePrefix("WebSocket", conf.WSPathPrefix); err != nil {
+		return nil, err
 	}
 
 	// Configure RPC servers.
@@ -178,12 +170,13 @@ func (n *Node) Start() error {
 		return ErrNodeStopped
 	}
 	n.state = runningState
-	err := n.startNetworking()
+	// open networking and RPC endpoints
+	err := n.openEndpoints()
 	lifecycles := make([]Lifecycle, len(n.lifecycles))
 	copy(lifecycles, n.lifecycles)
 	n.lock.Unlock()
 
-	// Check if networking startup failed.
+	// Check if endpoint startup failed.
 	if err != nil {
 		n.doClose(nil)
 		return err
@@ -243,15 +236,6 @@ func (n *Node) doClose(errs []error) error {
 	}
 	n.lock.Unlock()
 
-	if err := n.accman.Close(); err != nil {
-		errs = append(errs, err)
-	}
-	if n.ephemKeystore != "" {
-		if err := os.RemoveAll(n.ephemKeystore); err != nil {
-			errs = append(errs, err)
-		}
-	}
-
 	// Release instance directory lock.
 	n.closeDataDir()
 
@@ -269,12 +253,14 @@ func (n *Node) doClose(errs []error) error {
 	}
 }
 
-// startNetworking starts all network endpoints.
-func (n *Node) startNetworking() error {
+// openEndpoints starts all network and RPC endpoints.
+func (n *Node) openEndpoints() error {
+	// start networking endpoints
 	n.log.Info("Starting peer-to-peer node", "instance", n.server.Name)
 	if err := n.server.Start(); err != nil {
 		return convertFileLockError(err)
 	}
+	// start RPC endpoints
 	err := n.startRPC()
 	if err != nil {
 		n.stopRPC()
@@ -370,6 +356,7 @@ func (n *Node) startRPC() error {
 			CorsAllowedOrigins: n.config.HTTPCors,
 			Vhosts:             n.config.HTTPVirtualHosts,
 			Modules:            n.config.HTTPModules,
+			prefix:             n.config.HTTPPathPrefix,
 		}
 		if err := n.http.setListenAddr(n.config.HTTPHost, n.config.HTTPPort); err != nil {
 			return err
@@ -385,6 +372,7 @@ func (n *Node) startRPC() error {
 		config := wsConfig{
 			Modules: n.config.WSModules,
 			Origins: n.config.WSOrigins,
+			prefix:  n.config.WSPathPrefix,
 		}
 		if err := server.setListenAddr(n.config.WSHost, n.config.WSPort); err != nil {
 			return err
@@ -453,7 +441,6 @@ func (n *Node) RegisterProtocols(protocols []p2p.Protocol) {
 	n.lock.Lock()
 	defer n.lock.Unlock()
 
-	// Remove the keystore if it was created ephemerally.
 	if n.state != initializingState {
 		panic("can't register protocols on running/stopped node")
 	}
@@ -482,6 +469,7 @@ func (n *Node) RegisterHandler(name, path string, handler http.Handler) {
 	if n.state != initializingState {
 		panic("can't register HTTP handler on running/stopped node")
 	}
+
 	n.http.mux.Handle(path, handler)
 	n.http.handlerNames[path] = name
 }
@@ -528,69 +516,30 @@ func (n *Node) InstanceDir() string {
 	return n.config.instanceDir()
 }
 
-// AccountManager retrieves the account manager used by the protocol stack.
-func (n *Node) AccountManager() *accounts.Manager {
-	return n.accman
-}
-
 // IPCEndpoint retrieves the current IPC endpoint used by the protocol stack.
 func (n *Node) IPCEndpoint() string {
 	return n.ipc.endpoint
 }
 
-// HTTPEndpoint returns the URL of the HTTP server.
+// HTTPEndpoint returns the URL of the HTTP server. Note that this URL does not
+// contain the JSON-RPC path prefix set by HTTPPathPrefix.
 func (n *Node) HTTPEndpoint() string {
 	return "http://" + n.http.listenAddr()
 }
 
-// WSEndpoint retrieves the current WS endpoint used by the protocol stack.
+// WSEndpoint returns the current JSON-RPC over WebSocket endpoint.
 func (n *Node) WSEndpoint() string {
 	if n.http.wsAllowed() {
-		return "ws://" + n.http.listenAddr()
+		return "ws://" + n.http.listenAddr() + n.http.wsConfig.prefix
 	}
-	return "ws://" + n.ws.listenAddr()
-}
-
-// EventMux retrieves the event multiplexer used by all the network services in
-// the current protocol stack.
-func (n *Node) EventMux() *event.TypeMux {
-	return n.eventmux
+	return "ws://" + n.ws.listenAddr() + n.ws.wsConfig.prefix
 }
 
 // OpenDatabase opens an existing database with the given name (or creates one if no
 // previous can be found) from within the node's instance directory. If the node is
 // ephemeral, a memory database is returned.
-func (n *Node) OpenDatabase(name string) (*ethdb.ObjectDatabase, error) {
-	return n.OpenDatabaseWithFreezer(name, 0, 0, "", "")
-}
-
-func (n *Node) ApplyMigrations(name string, tmpdir string) error {
-	if n.config.DataDir == "" {
-		return nil
-	}
-	n.lock.Lock()
-	defer n.lock.Unlock()
-
-	dbPath, err := n.config.ResolvePath(name)
-	if err != nil {
-		return err
-	}
-	var kv ethdb.KV
-
-	if n.config.MDBX {
-		kv, err = ethdb.NewMDBX().Path(dbPath).Exclusive().Open()
-		if err != nil {
-			return fmt.Errorf("failed to open kv inside stack.ApplyMigrations: %w", err)
-		}
-	} else {
-		kv, err = ethdb.NewLMDB().Path(dbPath).MapSize(n.config.LMDBMapSize).MaxFreelistReuse(n.config.LMDBMaxFreelistReuse).Exclusive().Open()
-		if err != nil {
-			return fmt.Errorf("failed to open kv inside stack.ApplyMigrations: %w", err)
-		}
-	}
-	defer kv.Close()
-
-	return migrations.NewMigrator().Apply(ethdb.NewObjectDatabase(kv), tmpdir)
+func (n *Node) OpenDatabase(name string, tmpdir string) (*ethdb.ObjectDatabase, error) {
+	return n.OpenDatabaseWithFreezer(name, tmpdir)
 }
 
 // OpenDatabaseWithFreezer opens an existing database with the given name (or
@@ -599,7 +548,7 @@ func (n *Node) ApplyMigrations(name string, tmpdir string) error {
 // database to immutable append-only files. If the node is an ephemeral one, a
 // memory database is returned.
 // NOTE: kept for compatibility and for easier rebases (turbo-geth)
-func (n *Node) OpenDatabaseWithFreezer(name string, _, _ int, _, _ string) (*ethdb.ObjectDatabase, error) {
+func (n *Node) OpenDatabaseWithFreezer(name string, tmpdir string) (*ethdb.ObjectDatabase, error) {
 	n.lock.Lock()
 	defer n.lock.Unlock()
 
@@ -612,28 +561,64 @@ func (n *Node) OpenDatabaseWithFreezer(name string, _, _ int, _, _ string) (*eth
 		fmt.Printf("Opening In-memory Database (LMDB): %s\n", name)
 		db = ethdb.NewMemDatabase()
 	} else {
+		dbPath, err := n.config.ResolvePath(name)
+		if err != nil {
+			return nil, err
+		}
+
+		var openFunc func(exclusive bool) (*ethdb.ObjectDatabase, error)
 		if n.config.MDBX {
 			log.Info("Opening Database (MDBX)", "mapSize", n.config.LMDBMapSize.HR())
-			dbPath, err := n.config.ResolvePath(name)
-			if err != nil {
-				return nil, err
+			openFunc = func(exclusive bool) (*ethdb.ObjectDatabase, error) {
+				opts := ethdb.NewMDBX().Path(dbPath).MapSize(n.config.LMDBMapSize)
+				if exclusive {
+					opts = opts.Exclusive()
+				}
+				kv, err1 := opts.Open()
+				if err1 != nil {
+					return nil, err1
+				}
+				return ethdb.NewObjectDatabase(kv), nil
 			}
-			kv, err := ethdb.NewMDBX().Path(dbPath).MapSize(n.config.LMDBMapSize).Open()
-			if err != nil {
-				return nil, err
-			}
-			db = ethdb.NewObjectDatabase(kv)
 		} else {
 			log.Info("Opening Database (LMDB)", "mapSize", n.config.LMDBMapSize.HR(), "maxFreelistReuse", n.config.LMDBMaxFreelistReuse)
-			dbPath, err := n.config.ResolvePath(name)
+			openFunc = func(exclusive bool) (*ethdb.ObjectDatabase, error) {
+				opts := ethdb.NewLMDB().Path(dbPath).MapSize(n.config.LMDBMapSize).MaxFreelistReuse(n.config.LMDBMaxFreelistReuse)
+				if exclusive {
+					opts = opts.Exclusive()
+				}
+				kv, err1 := opts.Open()
+				if err1 != nil {
+					return nil, err1
+				}
+				return ethdb.NewObjectDatabase(kv), nil
+			}
+		}
+
+		db, err = openFunc(false)
+		if err != nil {
+			return nil, err
+		}
+		migrator := migrations.NewMigrator()
+		has, err := migrator.HasPendingMigrations(db)
+		if err != nil {
+			return nil, err
+		}
+		if has {
+			log.Info("Re-Opening DB in exclusive mode to apply migrations")
+			db.Close()
+			db, err = openFunc(true)
 			if err != nil {
 				return nil, err
 			}
-			kv, err := ethdb.NewLMDB().Path(dbPath).MapSize(n.config.LMDBMapSize).MaxFreelistReuse(n.config.LMDBMaxFreelistReuse).Open()
+			if err = migrator.Apply(db, tmpdir); err != nil {
+				return nil, err
+			}
+			db.Close()
+			db, err = openFunc(false)
 			if err != nil {
 				return nil, err
 			}
-			db = ethdb.NewObjectDatabase(kv)
 		}
 	}
 

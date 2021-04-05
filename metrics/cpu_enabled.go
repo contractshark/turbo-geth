@@ -20,15 +20,19 @@ package metrics
 
 import (
 	"github.com/ledgerwatch/turbo-geth/log"
-	"github.com/shirou/gopsutil/cpu"
+	"github.com/shirou/gopsutil/v3/cpu"
+	"github.com/shirou/gopsutil/v3/process"
 )
 
-// ReadCPUStats retrieves the current CPU stats.
-func ReadCPUStats(stats *CPUStats) {
+func ReadCPUStats(p *process.Process, stats *CPUStats) {
 	// passing false to request all cpu times
 	timeStats, err := cpu.Times(false)
 	if err != nil {
 		log.Error("Could not read cpu stats", "err", err)
+		return
+	}
+	if len(timeStats) == 0 {
+		log.Error("Empty cpu stats")
 		return
 	}
 	// requesting all cpu times will always return an array with only one time stats entry

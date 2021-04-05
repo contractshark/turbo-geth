@@ -77,10 +77,6 @@ type Engine interface {
 	// rules of a given engine.
 	VerifyUncles(chain ChainReader, block *types.Block) error
 
-	// VerifySeal checks whether the crypto seal on a header is valid according to
-	// the consensus rules of the given engine.
-	VerifySeal(chain ChainHeaderReader, header *types.Header) error
-
 	// Prepare initializes the consensus fields of a block header according to the
 	// rules of a particular engine. The changes are executed inline.
 	Prepare(chain ChainHeaderReader, header *types.Header) error
@@ -105,7 +101,7 @@ type Engine interface {
 	//
 	// Note, the method returns immediately and will send the result async. More
 	// than one result may also be returned depending on the consensus algorithm.
-	Seal(ctx Cancel, chain ChainHeaderReader, block *types.Block, results chan<- ResultWithContext, stop <-chan struct{}) error
+	Seal(chain ChainHeaderReader, block *types.Block, results chan<- *types.Block, stop <-chan struct{}) error
 
 	// SealHash returns the hash of a block prior to it being sealed.
 	SealHash(header *types.Header) common.Hash

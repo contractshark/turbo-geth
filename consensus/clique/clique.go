@@ -27,13 +27,13 @@ import (
 	"time"
 
 	lru "github.com/hashicorp/golang-lru"
-	"github.com/ledgerwatch/turbo-geth/accounts"
 	"github.com/ledgerwatch/turbo-geth/common"
 	"github.com/ledgerwatch/turbo-geth/common/hexutil"
 	"github.com/ledgerwatch/turbo-geth/consensus"
 	"github.com/ledgerwatch/turbo-geth/consensus/misc"
 	"github.com/ledgerwatch/turbo-geth/core/state"
 	"github.com/ledgerwatch/turbo-geth/core/types"
+	"github.com/ledgerwatch/turbo-geth/core/types/accounts"
 	"github.com/ledgerwatch/turbo-geth/crypto"
 	"github.com/ledgerwatch/turbo-geth/ethdb"
 	"github.com/ledgerwatch/turbo-geth/log"
@@ -138,7 +138,7 @@ var (
 )
 
 // SignerFn hashes and signs the data to be signed by a backing account.
-type SignerFn func(signer accounts.Account, mimeType string, message []byte) ([]byte, error)
+type SignerFn func(signer common.Address, mimeType string, message []byte) ([]byte, error)
 
 // ecrecover extracts the Ethereum account address from a signed header.
 func ecrecover(header *types.Header, sigcache *lru.ARCCache) (common.Address, error) {
@@ -377,17 +377,17 @@ func (c *Clique) snapshot(chain consensus.ChainHeaderReader, number uint64, hash
 		if number == 0 || (number%c.config.Epoch == 0 && (len(headers) > params.FullImmutabilityThreshold || chain.GetHeaderByNumber(number-1) == nil)) {
 			checkpoint := chain.GetHeaderByNumber(number)
 			if checkpoint != nil {
-				hash := checkpoint.Hash()
+				checkpointHash := checkpoint.Hash()
 
 				signers := make([]common.Address, (len(checkpoint.Extra)-extraVanity-extraSeal)/common.AddressLength)
 				for i := 0; i < len(signers); i++ {
 					copy(signers[i][:], checkpoint.Extra[extraVanity+i*common.AddressLength:])
 				}
-				snap = newSnapshot(c.config, c.signatures, number, hash, signers)
+				snap = newSnapshot(c.config, c.signatures, number, checkpointHash, signers)
 				if err := snap.store(c.db); err != nil {
 					return nil, err
 				}
-				log.Info("Stored checkpoint snapshot to disk", "number", number, "hash", hash)
+				log.Info("Stored checkpoint snapshot to disk", "number", number, "hash", checkpointHash)
 				break
 			}
 		}
@@ -437,12 +437,6 @@ func (c *Clique) VerifyUncles(chain consensus.ChainReader, block *types.Block) e
 		return errors.New("uncles not allowed")
 	}
 	return nil
-}
-
-// VerifySeal implements consensus.Engine, checking whether the signature contained
-// in the header satisfies the consensus protocol requirements.
-func (c *Clique) VerifySeal(chain consensus.ChainHeaderReader, header *types.Header) error {
-	return c.verifySeal(chain, header, nil)
 }
 
 // verifySeal checks whether the signature contained in the header satisfies the
@@ -584,7 +578,7 @@ func (c *Clique) Authorize(signer common.Address, signFn SignerFn) {
 
 // Seal implements consensus.Engine, attempting to create a sealed block using
 // the local signing credentials.
-func (c *Clique) Seal(ctx consensus.Cancel, chain consensus.ChainHeaderReader, block *types.Block, results chan<- consensus.ResultWithContext, stop <-chan struct{}) error {
+func (c *Clique) Seal(chain consensus.ChainHeaderReader, block *types.Block, results chan<- *types.Block, stop <-chan struct{}) error {
 	header := block.Header()
 
 	// Sealing the genesis block is not supported
@@ -630,7 +624,7 @@ func (c *Clique) Seal(ctx consensus.Cancel, chain consensus.ChainHeaderReader, b
 		log.Trace("Out-of-turn signing requested", "wiggle", common.PrettyDuration(wiggle))
 	}
 	// Sign all the things!
-	sighash, err := signFn(accounts.Account{Address: signer}, accounts.MimetypeClique, CliqueRLP(header))
+	sighash, err := signFn(signer, accounts.MimetypeClique, CliqueRLP(header))
 	if err != nil {
 		return err
 	}
@@ -645,7 +639,7 @@ func (c *Clique) Seal(ctx consensus.Cancel, chain consensus.ChainHeaderReader, b
 		}
 
 		select {
-		case results <- consensus.ResultWithContext{Cancel: ctx, Block: block.WithSeal(header)}:
+		case results <- block.WithSeal(header):
 		default:
 			log.Warn("Sealing result is not read by miner", "sealhash", SealHash(header))
 		}

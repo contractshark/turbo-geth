@@ -14,7 +14,7 @@ var (
 			dbutils.BodiesSnapshotInfoBucket: dbutils.BucketConfigItem{},
 		},
 		SnapshotType_headers: {
-			dbutils.HeaderPrefix:              dbutils.BucketConfigItem{},
+			dbutils.HeadersBucket:             dbutils.BucketConfigItem{},
 			dbutils.HeadersSnapshotInfoBucket: dbutils.BucketConfigItem{},
 		},
 		SnapshotType_state: {
@@ -31,7 +31,7 @@ var (
 	}
 )
 
-func WrapBySnapshotsFromDir(kv ethdb.KV, snapshotDir string, mode SnapshotMode) (ethdb.KV, error) {
+func WrapBySnapshotsFromDir(kv ethdb.RwKV, snapshotDir string, mode SnapshotMode) (ethdb.RwKV, error) {
 	log.Info("Wrap db to snapshots", "dir", snapshotDir, "mode", mode.ToString())
 	snkv := ethdb.NewSnapshot2KV().DB(kv)
 
@@ -55,7 +55,7 @@ func WrapBySnapshotsFromDir(kv ethdb.KV, snapshotDir string, mode SnapshotMode) 
 			log.Error("Can't open headers snapshot", "err", err)
 			return nil, err
 		} else { //nolint
-			snkv.SnapshotDB([]string{dbutils.HeaderPrefix, dbutils.HeadersSnapshotInfoBucket}, snapshotKV)
+			snkv.SnapshotDB([]string{dbutils.HeadersBucket, dbutils.HeadersSnapshotInfoBucket}, snapshotKV)
 		}
 	}
 	if mode.State {
@@ -72,7 +72,7 @@ func WrapBySnapshotsFromDir(kv ethdb.KV, snapshotDir string, mode SnapshotMode) 
 	return snkv.MustOpen(), nil
 }
 
-func WrapBySnapshotsFromDownloader(kv ethdb.KV, snapshots map[SnapshotType]*SnapshotsInfo) (ethdb.KV, error) {
+func WrapBySnapshotsFromDownloader(kv ethdb.RwKV, snapshots map[SnapshotType]*SnapshotsInfo) (ethdb.RwKV, error) {
 	snKV := ethdb.NewSnapshot2KV().DB(kv)
 	for k, v := range snapshots {
 		log.Info("Wrap db by", "snapshot", k.String(), "dir", v.Dbpath)

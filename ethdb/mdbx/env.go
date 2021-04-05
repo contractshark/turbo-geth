@@ -26,15 +26,16 @@ const (
 	EnvDefaults = C.MDBX_ENV_DEFAULTS
 	LifoReclaim = C.MDBX_LIFORECLAIM
 	//FixedMap    = C.MDBX_FIXEDMAP   // Danger zone. Map memory at a fixed address.
-	NoSubdir   = C.MDBX_NOSUBDIR // Argument to Open is a file, not a directory.
-	Accede     = C.MDBX_ACCEDE
-	Coalesce   = C.MDBX_COALESCE
-	Readonly   = C.MDBX_RDONLY     // Used in several functions to denote an object as readonly.
-	WriteMap   = C.MDBX_WRITEMAP   // Use a writable memory map.
-	NoMetaSync = C.MDBX_NOMETASYNC // Don't fsync metapage after commit.
-	SafeNoSync = C.MDBX_SAFE_NOSYNC
-	Durable    = C.MDBX_SYNC_DURABLE
-	NoTLS      = C.MDBX_NOTLS // Danger zone. When unset reader locktable slots are tied to their thread.
+	NoSubdir      = C.MDBX_NOSUBDIR // Argument to Open is a file, not a directory.
+	Accede        = C.MDBX_ACCEDE
+	Coalesce      = C.MDBX_COALESCE
+	Readonly      = C.MDBX_RDONLY     // Used in several functions to denote an object as readonly.
+	WriteMap      = C.MDBX_WRITEMAP   // Use a writable memory map.
+	NoMetaSync    = C.MDBX_NOMETASYNC // Don't fsync metapage after commit.
+	UtterlyNoSync = C.MDBX_UTTERLY_NOSYNC
+	SafeNoSync    = C.MDBX_SAFE_NOSYNC
+	Durable       = C.MDBX_SYNC_DURABLE
+	NoTLS         = C.MDBX_NOTLS // Danger zone. When unset reader locktable slots are tied to their thread.
 	//NoLock      = C.MDBX_NOLOCK     // Danger zone. LMDB does not use any locks.
 	NoReadahead = C.MDBX_NORDAHEAD // Disable readahead. Requires OS support.
 	NoMemInit   = C.MDBX_NOMEMINIT // Disable LMDB memory initialization.
@@ -177,10 +178,6 @@ func (env *Env) FD() (uintptr, error) {
 	return fd, nil
 }
 
-func (env *Env) StderrLogger() *C.MDBX_debug_func {
-	return C.mdbxgo_stderr_logger()
-}
-
 // ReaderList dumps the contents of the reader lock table as text.  Readers
 // start on the second line as space-delimited fields described by the first
 // line.
@@ -299,13 +296,7 @@ type Stat struct {
 // See mdbx_env_stat.
 func (env *Env) Stat() (*Stat, error) {
 	var _stat C.MDBX_stat
-	var ret C.int
-	if err := env.View(func(txn *Txn) error {
-		ret = C.mdbx_env_stat_ex(env._env, txn._txn, &_stat, C.size_t(unsafe.Sizeof(_stat)))
-		return nil
-	}); err != nil {
-		return nil, err
-	}
+	var ret C.int = C.mdbx_env_stat_ex(env._env, nil, &_stat, C.size_t(unsafe.Sizeof(_stat)))
 	if ret != success {
 		return nil, operrno("mdbx_env_stat_ex", ret)
 	}
@@ -323,8 +314,15 @@ func (env *Env) Stat() (*Stat, error) {
 //
 // See MDBX_envinfo.
 type EnvInfo struct {
-	MapSize                        int64 // Size of the data memory map
-	LastPNO                        int64 // ID of the last used page
+	MapSize int64 // Size of the data memory map
+	LastPNO int64 // ID of the last used page
+	Geo     struct {
+		Lower   uint64
+		Upper   uint64
+		Current uint64
+		Shrink  uint64
+		Grow    uint64
+	}
 	LastTxnID                      int64 // ID of the last committed transaction
 	MaxReaders                     uint  // maximum number of threads for the environment
 	NumReaders                     uint  // maximum number of threads used in the environment
@@ -353,7 +351,20 @@ func (env *Env) Info() (*EnvInfo, error) {
 		return nil, operrno("mdbx_env_info", ret)
 	}
 	info := EnvInfo{
-		MapSize:        int64(_info.mi_mapsize),
+		MapSize: int64(_info.mi_mapsize),
+		Geo: struct {
+			Lower   uint64
+			Upper   uint64
+			Current uint64
+			Shrink  uint64
+			Grow    uint64
+		}{
+			Lower:   uint64(_info.mi_geo.lower),
+			Upper:   uint64(_info.mi_geo.upper),
+			Current: uint64(_info.mi_geo.current),
+			Shrink:  uint64(_info.mi_geo.shrink),
+			Grow:    uint64(_info.mi_geo.grow),
+		},
 		LastPNO:        int64(_info.mi_last_pgno),
 		LastTxnID:      int64(_info.mi_recent_txnid),
 		MaxReaders:     uint(_info.mi_maxreaders),
@@ -371,7 +382,7 @@ func (env *Env) Info() (*EnvInfo, error) {
 }
 
 // Sync flushes buffers to disk.  If force is true a synchronous flush occurs
-// and ignores any NoSync or MapAsync flag on the environment.
+// and ignores any UtterlyNoSync or MapAsync flag on the environment.
 //
 // See mdbx_env_sync.
 func (env *Env) Sync(force bool, nonblock bool) error {
@@ -528,19 +539,12 @@ func (env *Env) SetMaxDBs(size int) error {
 // methods, which assist in management of Txn objects and provide OS thread
 // locking required for write transactions.
 //
-// A finalizer detects unreachable, live transactions and logs thems to
-// standard error.  The transactions are aborted, but their presence should be
-// interpreted as an application error which should be patched so transactions
-// are terminated explicitly.  Unterminated transactions can adversly effect
+// Unterminated transactions can adversly effect
 // database performance and cause the database to grow until the map is full.
 //
 // See mdbx_txn_begin.
 func (env *Env) BeginTxn(parent *Txn, flags uint) (*Txn, error) {
-	txn, err := beginTxn(env, parent, flags)
-	if txn != nil {
-		runtime.SetFinalizer(txn, func(v interface{}) { v.(*Txn).finalize() })
-	}
-	return txn, err
+	return beginTxn(env, parent, flags)
 }
 
 // RunTxn creates a new Txn and calls fn with it as an argument.  Run commits

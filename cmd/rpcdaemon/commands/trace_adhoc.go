@@ -124,7 +124,7 @@ func (args *TraceCallParam) ToMessage(globalGasCap uint64) types.Message {
 		input = args.Data
 	}
 
-	msg := types.NewMessage(addr, args.To, 0 /* nonce */, value, gas, gasPrice, input, false /* checkNonce */)
+	msg := types.NewMessage(addr, args.To, 0 /* nonce */, value, gas, gasPrice, input, types.AccessList{}, false /* checkNonce */)
 	return msg
 }
 
@@ -260,11 +260,11 @@ func (ot *OeTracer) CaptureEnd(depth int, output []byte, gasUsed uint64, t time.
 	return nil
 }
 
-func (ot *OeTracer) CaptureState(env *vm.EVM, pc uint64, op vm.OpCode, gas, cost uint64, memory *vm.Memory, st *stack.Stack, retst *stack.ReturnStack, rData []byte, contract *vm.Contract, opDepth int, err error) error {
+func (ot *OeTracer) CaptureState(env *vm.EVM, pc uint64, op vm.OpCode, gas, cost uint64, memory *vm.Memory, st *stack.Stack, rData []byte, contract *vm.Contract, opDepth int, err error) error {
 	return nil
 }
 
-func (ot *OeTracer) CaptureFault(env *vm.EVM, pc uint64, op vm.OpCode, gas, cost uint64, memory *vm.Memory, stack *stack.Stack, rst *stack.ReturnStack, contract *vm.Contract, opDepth int, err error) error {
+func (ot *OeTracer) CaptureFault(env *vm.EVM, pc uint64, op vm.OpCode, gas, cost uint64, memory *vm.Memory, stack *stack.Stack, contract *vm.Contract, opDepth int, err error) error {
 	//fmt.Printf("CaptureFault depth %d\n", opDepth)
 	return nil
 }
@@ -436,7 +436,7 @@ const callTimeout = 5 * time.Minute
 
 // Call implements trace_call.
 func (api *TraceAPIImpl) Call(ctx context.Context, args TraceCallParam, traceTypes []string, blockNrOrHash *rpc.BlockNumberOrHash) (*TraceCallResult, error) {
-	dbtx, err := api.dbReader.Begin(ctx, ethdb.RO)
+	dbtx, err := api.kv.BeginRo(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -451,19 +451,19 @@ func (api *TraceAPIImpl) Call(ctx context.Context, args TraceCallParam, traceTyp
 		var num = rpc.LatestBlockNumber
 		blockNrOrHash = &rpc.BlockNumberOrHash{BlockNumber: &num}
 	}
-	blockNumber, hash, err := rpchelper.GetBlockNumber(*blockNrOrHash, dbtx)
+	blockNumber, hash, err := rpchelper.GetBlockNumber(*blockNrOrHash, dbtx, api.pending)
 	if err != nil {
 		return nil, err
 	}
 	var stateReader state.StateReader
 	if num, ok := blockNrOrHash.Number(); ok && num == rpc.LatestBlockNumber {
-		stateReader = state.NewPlainStateReader(dbtx)
+		stateReader = state.NewPlainStateReader(ethdb.NewRoTxDb(dbtx))
 	} else {
-		stateReader = state.NewPlainDBState(dbtx, blockNumber)
+		stateReader = state.NewPlainDBState(ethdb.NewRoTxDb(dbtx), blockNumber)
 	}
 	ibs := state.New(stateReader)
 
-	header := rawdb.ReadHeader(dbtx, hash, blockNumber)
+	header := rawdb.ReadHeader(ethdb.NewRoTxDb(dbtx), hash, blockNumber)
 	if header == nil {
 		return nil, fmt.Errorf("block %d(%x) not found", blockNumber, hash)
 	}
@@ -504,9 +504,9 @@ func (api *TraceAPIImpl) Call(ctx context.Context, args TraceCallParam, traceTyp
 	// Get a new instance of the EVM.
 	msg := args.ToMessage(api.gasCap)
 
-	evmCtx := transactions.GetEvmContext(msg, header, blockNrOrHash.RequireCanonical, dbtx)
+	blockCtx, txCtx := transactions.GetEvmContext(msg, header, blockNrOrHash.RequireCanonical, dbtx)
 
-	evm := vm.NewEVM(evmCtx, ibs, chainConfig, vm.Config{Debug: traceTypeTrace, Tracer: &ot})
+	evm := vm.NewEVM(blockCtx, txCtx, ibs, chainConfig, vm.Config{Debug: traceTypeTrace, Tracer: &ot})
 
 	// Wait for the context to be done and cancel the evm. Even if the
 	// EVM has finished, cancelling may be done (repeatedly)
@@ -547,7 +547,7 @@ func (api *TraceAPIImpl) Call(ctx context.Context, args TraceCallParam, traceTyp
 
 // CallMany implements trace_callMany.
 func (api *TraceAPIImpl) CallMany(ctx context.Context, calls json.RawMessage, blockNrOrHash *rpc.BlockNumberOrHash) ([]*TraceCallResult, error) {
-	dbtx, err := api.dbReader.Begin(ctx, ethdb.RO)
+	dbtx, err := api.kv.BeginRo(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -562,22 +562,22 @@ func (api *TraceAPIImpl) CallMany(ctx context.Context, calls json.RawMessage, bl
 		var num = rpc.LatestBlockNumber
 		blockNrOrHash = &rpc.BlockNumberOrHash{BlockNumber: &num}
 	}
-	blockNumber, hash, err := rpchelper.GetBlockNumber(*blockNrOrHash, dbtx)
+	blockNumber, hash, err := rpchelper.GetBlockNumber(*blockNrOrHash, dbtx, api.pending)
 	if err != nil {
 		return nil, err
 	}
 	var stateReader state.StateReader
 	if num, ok := blockNrOrHash.Number(); ok && num == rpc.LatestBlockNumber {
-		stateReader = state.NewPlainStateReader(dbtx)
+		stateReader = state.NewPlainStateReader(ethdb.NewRoTxDb(dbtx))
 	} else {
-		stateReader = state.NewPlainDBState(dbtx, blockNumber)
+		stateReader = state.NewPlainDBState(ethdb.NewRoTxDb(dbtx), blockNumber)
 	}
 	stateCache := shards.NewStateCache(32, 0 /* no limit */)
 	cachedReader := state.NewCachedReader(stateReader, stateCache)
 	noop := state.NewNoopWriter()
 	cachedWriter := state.NewCachedWriter(noop, stateCache)
 
-	header := rawdb.ReadHeader(dbtx, hash, blockNumber)
+	header := rawdb.ReadHeader(ethdb.NewRoTxDb(dbtx), hash, blockNumber)
 	if header == nil {
 		return nil, fmt.Errorf("block %d(%x) not found", blockNumber, hash)
 	}
@@ -594,7 +594,7 @@ func (api *TraceAPIImpl) CallMany(ctx context.Context, calls json.RawMessage, bl
 	// Make sure the context is cancelled when the call has completed
 	// this makes sure resources are cleaned up.
 	defer cancel()
-	var results []*TraceCallResult
+	results := []*TraceCallResult{}
 
 	dec := json.NewDecoder(bytes.NewReader(calls))
 	tok, err := dec.Token()
@@ -651,11 +651,11 @@ func (api *TraceAPIImpl) CallMany(ctx context.Context, calls json.RawMessage, bl
 		// Get a new instance of the EVM.
 		msg := args.ToMessage(api.gasCap)
 
-		evmCtx := transactions.GetEvmContext(msg, header, blockNrOrHash.RequireCanonical, dbtx)
+		blockCtx, txCtx := transactions.GetEvmContext(msg, header, blockNrOrHash.RequireCanonical, dbtx)
 		ibs := state.New(cachedReader)
 		// Create initial IntraBlockState, we will compare it with ibs (IntraBlockState after the transaction)
 
-		evm := vm.NewEVM(evmCtx, ibs, chainConfig, vm.Config{Debug: traceTypeTrace, Tracer: &ot})
+		evm := vm.NewEVM(blockCtx, txCtx, ibs, chainConfig, vm.Config{Debug: traceTypeTrace, Tracer: &ot})
 
 		gp := new(core.GasPool).AddGas(msg.Gas())
 		var execResult *core.ExecutionResult
@@ -678,10 +678,10 @@ func (api *TraceAPIImpl) CallMany(ctx context.Context, calls json.RawMessage, bl
 			if err = ibs.FinalizeTx(ctx, sd); err != nil {
 				return nil, err
 			}
+			sd.CompareStates(initialIbs, ibs)
 			if err = ibs.CommitBlock(ctx, cachedWriter); err != nil {
 				return nil, err
 			}
-			sd.CompareStates(initialIbs, ibs)
 		} else {
 			if err = ibs.FinalizeTx(ctx, noop); err != nil {
 				return nil, err

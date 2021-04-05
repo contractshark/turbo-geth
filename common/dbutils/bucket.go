@@ -4,43 +4,43 @@ import (
 	"bytes"
 	"sort"
 	"strings"
-
-	"github.com/ledgerwatch/turbo-geth/metrics"
 )
 
 // Buckets
+
+// Dictionary:
+// "Plain State" - state where keys arent' hashed. "CurrentState" - same, but keys are hashed. "PlainState" used for blocks execution. "CurrentState" used mostly for Merkle root calculation.
+// "incarnation" - uint64 number - how much times given account was SelfDestruct'ed.
+
+/*PlainStateBucket
+Logical layout:
+	Contains Accounts:
+	  key - address (unhashed)
+	  value - account encoded for storage
+	Contains Storage:
+	  key - address (unhashed) + incarnation + storage key (unhashed)
+	  value - storage value(common.hash)
+
+Physical layout:
+	PlainStateBucket and HashedStorageBucket utilises DupSort feature of LMDB (store multiple values inside 1 key).
+-------------------------------------------------------------
+	   key              |            value
+-------------------------------------------------------------
+[acc_hash]              | [acc_value]
+[acc_hash]+[inc]        | [storage1_hash]+[storage1_value]
+						| [storage2_hash]+[storage2_value] // this value has no own key. it's 2nd value of [acc_hash]+[inc] key.
+						| [storage3_hash]+[storage3_value]
+						| ...
+[acc_hash]+[old_inc]    | [storage1_hash]+[storage1_value]
+						| ...
+[acc2_hash]             | [acc2_value]
+						...
+*/
+var PlainStateBucket = "PLAIN-CST2"
+var PlainStateBucketOld1 = "PLAIN-CST"
+
 var (
-	// "Plain State" - state where keys arent' hashed. "CurrentState" - same, but keys are hashed. "PlainState" used for blocks execution. "CurrentState" used mostly for Merkle root calculation.
-	// "incarnation" - uint64 number - how much times given account was SelfDestruct'ed.
-
-	/*
-		Logical layout:
-			Contains Accounts:
-			  key - address (unhashed)
-			  value - account encoded for storage
-			Contains Storage:
-			  key - address (unhashed) + incarnation + storage key (unhashed)
-			  value - storage value(common.hash)
-
-		Physical layout:
-			PlainStateBucket and HashedStorageBucket utilises DupSort feature of LMDB (store multiple values inside 1 key).
-		-------------------------------------------------------------
-			   key              |            value
-		-------------------------------------------------------------
-		[acc_hash]              | [acc_value]
-		[acc_hash]+[inc]        | [storage1_hash]+[storage1_value]
-								| [storage2_hash]+[storage2_value] // this value has no own key. it's 2nd value of [acc_hash]+[inc] key.
-								| [storage3_hash]+[storage3_value]
-								| ...
-		[acc_hash]+[old_inc]    | [storage1_hash]+[storage1_value]
-								| ...
-		[acc2_hash]             | [acc2_value]
-								...
-	*/
-	PlainStateBucket     = "PLAIN-CST2"
-	PlainStateBucketOld1 = "PLAIN-CST"
-
-	// "Plain State"
+	//PlainContractCodeBucket -
 	//key - address+incarnation
 	//value - code hash
 	PlainContractCodeBucket = "PLAIN-contractCode"
@@ -55,16 +55,16 @@ var (
 	// value - encoded ChangeSet{k - plainCompositeKey(for storage) v - originalValue(common.Hash)}.
 	PlainStorageChangeSetBucket = "PLAIN-SCS"
 
-	// Contains Accounts:
+	//HashedAccountsBucket
 	// key - address hash
 	// value - account encoded for storage
 	// Contains Storage:
 	//key - address hash + incarnation + storage key hash
 	//value - storage value(common.hash)
-	CurrentStateBucketOld2 = "CST2"
-	CurrentStateBucketOld1 = "CST"
 	HashedAccountsBucket   = "hashed_accounts"
 	HashedStorageBucket    = "hashed_storage"
+	CurrentStateBucketOld2 = "CST2"
+	CurrentStateBucketOld1 = "CST"
 
 	//key - address + shard_id_u64
 	//value - roaring bitmap  - list of block where it changed
@@ -86,42 +86,54 @@ var (
 	//key - address
 	//value - incarnation of account when it was last deleted
 	IncarnationMapBucket = "incarnationMap"
+)
 
-	/*
-		TrieOfAccountsBucket and TrieOfStorageBucket
-		hasState,groups - mark prefixes existing in hashed_account table
-		hasBranch - mark prefixes existing in trie_account table (not related with branchNodes)
-		hasHash - mark prefixes which hashes are saved in current trie_account record (actually only hashes of branchNodes can be saved)
-		@see UnmarshalTrieNode
-		@see integrity.Trie
+/*TrieOfAccountsBucket and TrieOfStorageBucket
+hasState,groups - mark prefixes existing in hashed_account table
+hasTree - mark prefixes existing in trie_account table (not related with branchNodes)
+hasHash - mark prefixes which hashes are saved in current trie_account record (actually only hashes of branchNodes can be saved)
+@see UnmarshalTrieNode
+@see integrity.Trie
 
-		+-----------------------------------------------------------------------------------------------------+
-		| DB record: 0x0B, hasState: 0b1011, hasBranch: 0b1001, hasHash: 0b1001, hashes: [x,x]                |
-		+-----------------------------------------------------------------------------------------------------+
-		                |                                         |                                |
-		                v                                         |                                v
-		+---------------------------------------------+           |             +--------------------------------------+
-		| DB record: 0x0B00, hasState: 0b10001        |           |             | DB record: 0x0B03, hasState: 0b10010 |
-		| hasBranch: 0, hasHash: 0b10000, hashes: [x] |           |             | hasBranch: 0, hasHash: 0, hashes: [] |
-		+---------------------------------------------+           |             +--------------------------------------+
-		        |               |                                 |                        |                  |
-		        v               v                                 v                        v                  v
-		+--------------+  +---------------------+          +---------------+        +---------------+  +---------------+
-		| Account:     |  | BranchNode: 0x0B0004|          | Account:      |        | Account:      |  | Account:      |
-		| 0x0B0000...  |  | has no record in DB |          | 0x0B01...     |        | 0x0B0301...   |  | 0x050304...   |
-		+--------------+  +---------------------+          +---------------+        +---------------+  +---------------+
-		                      |           |
-		                      v           v
++-----------------------------------------------------------------------------------------------------+
+| DB record: 0x0B, hasState: 0b1011, hasTree: 0b1001, hasHash: 0b1001, hashes: [x,x]                  |
++-----------------------------------------------------------------------------------------------------+
+                |                                           |                               |
+                v                                           |                               v
++---------------------------------------------+             |            +--------------------------------------+
+| DB record: 0x0B00, hasState: 0b10001        |             |            | DB record: 0x0B03, hasState: 0b10010 |
+| hasTree: 0, hasHash: 0b10000, hashes: [x]   |             |            | hasTree: 0, hasHash: 0, hashes: []   |
++---------------------------------------------+             |            +--------------------------------------+
+        |                    |                              |                         |                  |
+        v                    v                              v                         v                  v
++------------------+    +----------------------+     +---------------+        +---------------+  +---------------+
+| Account:         |    | BranchNode: 0x0B0004 |     | Account:      |        | Account:      |  | Account:      |
+| 0x0B0000...      |    | has no record in     |     | 0x0B01...     |        | 0x0B0301...   |  | 0x0B0304...   |
+| in HashedAccount |    |     TrieAccount      |     |               |        |               |  |               |
++------------------+    +----------------------+     +---------------+        +---------------+  +---------------+
+                           |                |
+                           v                v
 		           +---------------+  +---------------+
 		           | Account:      |  | Account:      |
 		           | 0x0B000400... |  | 0x0B000401... |
 		           +---------------+  +---------------+
-	*/
-	TrieOfAccountsBucket           = "trie_account"
-	TrieOfStorageBucket            = "trie_storage"
-	IntermediateTrieHashBucketOld1 = "iTh"
-	IntermediateTrieHashBucketOld2 = "iTh2"
+Invariants:
+- hasTree is subset of hasState
+- hasHash is subset of hasState
+- first level in account_trie always exists if hasState>0
+- TrieStorage record of account.root (length=40) must have +1 hash - it's account.root
+- each record in TrieAccount table must have parent (may be not direct) and this parent must have correct bit in hasTree bitmap
+- if hasState has bit - then HashedAccount table must have record according to this bit
+- each TrieAccount record must cover some state (means hasState is always > 0)
+- TrieAccount records with length=1 can satisfy (hasBranch==0&&hasHash==0) condition
+- Other records in TrieAccount and TrieStorage must (hasTree!=0 || hasHash!=0)
+*/
+var TrieOfAccountsBucket = "trie_account"
+var TrieOfStorageBucket = "trie_storage"
+var IntermediateTrieHashBucketOld1 = "iTh"
+var IntermediateTrieHashBucketOld2 = "iTh2"
 
+var (
 	// DatabaseInfoBucket is used to store information about data layout.
 	DatabaseInfoBucket        = "DBINFO"
 	SnapshotInfoBucket        = "SNINFO"
@@ -133,10 +145,12 @@ var (
 	DatabaseVerisionKey = "DatabaseVersion"
 
 	// Data item prefixes (use single byte to avoid mixing data types, avoid `i`, used for indexes).
-	HeaderPrefix       = "h"         // block_num_u64 + hash -> header
-	HeaderTDSuffix     = []byte("t") // block_num_u64 + hash + headerTDSuffix -> td
-	HeaderHashSuffix   = []byte("n") // block_num_u64 + headerHashSuffix -> hash
-	HeaderNumberPrefix = "H"         // headerNumberPrefix + hash -> num (uint64 big endian)
+	HeaderPrefixOld    = "h" // block_num_u64 + hash -> header
+	HeaderNumberBucket = "H" // headerNumberPrefix + hash -> num (uint64 big endian)
+
+	HeaderCanonicalBucket = "canonical_headers" // block_num_u64 -> header hash
+	HeadersBucket         = "headers"           // block_num_u64 + hash -> header (RLP)
+	HeaderTDBucket        = "header_to_td"      // block_num_u64 + hash -> td (RLP)
 
 	BlockBodyPrefix     = "b"      // block_num_u64 + hash -> block body
 	EthTx               = "eth_tx" // tbl_sequence_u64 -> rlp(tx)
@@ -183,12 +197,13 @@ var (
 	// Transaction senders - stored separately from the block bodies
 	Senders = "txSenders"
 
-	// fastTrieProgressKey tracks the number of trie entries imported during fast sync.
-	FastTrieProgressKey = "TrieSync"
 	// headBlockKey tracks the latest know full block's hash.
 	HeadBlockKey = "LastBlock"
 	// headFastBlockKey tracks the latest known incomplete block's hash during fast sync.
 	HeadFastBlockKey = "LastFast"
+
+	InvalidBlock    = "InvalidBlock"     // Inherited from go-ethereum, not used in turbo-geth yet
+	UncleanShutdown = "unclean-shutdown" // Inherited from go-ethereum, not used in turbo-geth yet
 
 	// migrationName -> serialized SyncStageProgress and SyncStageUnwind buckets
 	// it stores stages progress to understand in which context was executed migration
@@ -196,6 +211,7 @@ var (
 	Migrations = "migrations"
 
 	Sequence = "sequence" // tbl_name -> seq_u64
+
 )
 
 // Keys
@@ -221,10 +237,10 @@ var (
 )
 
 // Metrics
-var (
-	PreimageCounter    = metrics.NewRegisteredCounter("db/preimage/total", nil)
-	PreimageHitCounter = metrics.NewRegisteredCounter("db/preimage/hits", nil)
-)
+//var (
+//PreimageCounter    = metrics.NewRegisteredCounter("db/preimage/total", nil)
+//PreimageHitCounter = metrics.NewRegisteredCounter("db/preimage/hits", nil)
+//)
 
 // Buckets - list of all buckets. App will panic if some bucket is not in this list.
 // This list will be sorted in `init` method.
@@ -236,8 +252,7 @@ var Buckets = []string{
 	CodeBucket,
 	ContractCodeBucket,
 	DatabaseVerisionKey,
-	HeaderPrefix,
-	HeaderNumberPrefix,
+	HeaderNumberBucket,
 	BlockBodyPrefix,
 	BlockReceiptsPrefix,
 	TxLookupPrefix,
@@ -255,7 +270,6 @@ var Buckets = []string{
 	PlainAccountChangeSetBucket,
 	PlainStorageChangeSetBucket,
 	Senders,
-	FastTrieProgressKey,
 	HeadBlockKey,
 	HeadFastBlockKey,
 	HeadHeaderKey,
@@ -276,6 +290,10 @@ var Buckets = []string{
 	HashedAccountsBucket,
 	HashedStorageBucket,
 	IntermediateTrieHashBucketOld2,
+
+	HeaderCanonicalBucket,
+	HeadersBucket,
+	HeaderTDBucket,
 }
 
 // DeprecatedBuckets - list of buckets which can be programmatically deleted - for example after migration
@@ -285,6 +303,7 @@ var DeprecatedBuckets = []string{
 	CurrentStateBucketOld1,
 	PlainStateBucketOld1,
 	IntermediateTrieHashBucketOld1,
+	HeaderPrefixOld,
 }
 
 type CustomComparator string
@@ -358,10 +377,6 @@ var BucketsConfigs = BucketsCfg{
 	PlainStorageChangeSetBucket: {
 		Flags: DupSort,
 	},
-	//TrieOfStorageBucket: {
-	//	Flags:               DupSort,
-	//	CustomDupComparator: DupCmpSuffix32,
-	//},
 	PlainStateBucket: {
 		Flags:                     DupSort,
 		AutoDupSortKeysConversion: true,
@@ -372,6 +387,7 @@ var BucketsConfigs = BucketsCfg{
 		Flags:               DupSort,
 		CustomDupComparator: DupCmpSuffix32,
 	},
+	InvalidBlock: {},
 }
 
 func sortBuckets() {

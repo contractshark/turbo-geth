@@ -57,8 +57,8 @@ SO_SUFFIX  := $(shell $(uname2sosuffix))
 
 HEADERS    := mdbx.h mdbx.h++
 LIBRARIES  := libmdbx.a libmdbx.$(SO_SUFFIX)
-TOOLS      := mdbx_stat mdbx_copy mdbx_dump mdbx_load mdbx_chk
-MANPAGES   := mdbx_stat.1 mdbx_copy.1 mdbx_dump.1 mdbx_load.1 mdbx_chk.1
+TOOLS      := mdbx_stat mdbx_copy mdbx_dump mdbx_load mdbx_chk mdbx_drop
+MANPAGES   := mdbx_stat.1 mdbx_copy.1 mdbx_dump.1 mdbx_load.1 mdbx_chk.1 mdbx_drop.1
 
 .PHONY: mdbx all install clean
 
@@ -72,7 +72,7 @@ strip: all
 	strip libmdbx.$(SO_SUFFIX) $(TOOLS)
 
 clean:
-	rm -rf $(TOOLS) mdbx_test @* *.[ao] *.[ls]o *.$(SO_SUFFIX) *.dSYM *~ tmp.db/* \
+	@rm -rf $(TOOLS) mdbx_test @* *.[ao] *.[ls]o *.$(SO_SUFFIX) *.dSYM *~ tmp.db/* \
 		*.gcov *.log *.err src/*.o test/*.o mdbx_example dist \
 		config.h src/config.h src/version.c *.tar*
 
@@ -88,7 +88,7 @@ libmdbx.$(SO_SUFFIX): mdbx-dylib.o mdbx++-dylib.o
 MAN_SRCDIR := man1/
 
 config.h: mdbx.c $(lastword $(MAKEFILE_LIST))
-	(echo '#define MDBX_BUILD_TIMESTAMP "$(shell date +%Y-%m-%dT%H:%M:%S%z)"' \
+	@(echo '#define MDBX_BUILD_TIMESTAMP "$(shell date +%Y-%m-%dT%H:%M:%S%z)"' \
 	&& echo '#define MDBX_BUILD_FLAGS "$(CXXSTD) $(CFLAGS) $(LDFLAGS) $(LIBS)"' \
 	&& echo '#define MDBX_BUILD_COMPILER "$(shell (LC_ALL=C $(CC) --version || echo 'Please use GCC or CLANG compatible compiler') | head -1)"' \
 	&& echo '#define MDBX_BUILD_TARGET "$(shell set -o pipefail; (LC_ALL=C $(CC) -v 2>&1 | grep -i '^Target:' | cut -d ' ' -f 2- || (LC_ALL=C $(CC) --version | grep -qi e2k && echo E2K) || echo 'Please use GCC or CLANG compatible compiler') | head -1)"' \
@@ -98,7 +98,7 @@ mdbx-dylib.o: config.h mdbx.c mdbx.h $(lastword $(MAKEFILE_LIST))
 	$(CC) $(CFLAGS) $(MDBX_OPTIONS) '-DMDBX_CONFIG_H="config.h"' -DLIBMDBX_EXPORTS=1 -c mdbx.c -o $@
 
 mdbx-static.o: config.h mdbx.c mdbx.h $(lastword $(MAKEFILE_LIST))
-	$(CC) $(CFLAGS) $(MDBX_OPTIONS) '-DMDBX_CONFIG_H="config.h"' -ULIBMDBX_EXPORTS -c mdbx.c -o $@
+	@$(CC) $(CFLAGS) $(MDBX_OPTIONS) '-DMDBX_CONFIG_H="config.h"' -ULIBMDBX_EXPORTS -c mdbx.c -o $@
 
 mdbx++-dylib.o: config.h mdbx.c++ mdbx.h mdbx.h++ $(lastword $(MAKEFILE_LIST))
 	$(CXX) $(CXXFLAGS) $(MDBX_OPTIONS) '-DMDBX_CONFIG_H="config.h"' -DLIBMDBX_EXPORTS=1 -c mdbx.c++ -o $@

@@ -24,6 +24,7 @@ import (
 	"math/big"
 
 	"github.com/holiman/uint256"
+	"github.com/ledgerwatch/turbo-geth/turbo/trie"
 
 	"github.com/ledgerwatch/turbo-geth/common"
 	"github.com/ledgerwatch/turbo-geth/common/hexutil"
@@ -84,11 +85,10 @@ func (t *VMTest) Run(vmconfig vm.Config, blockNr uint64) error {
 	db := ethdb.NewMemDatabase()
 	defer db.Close()
 	ctx := params.MainnetChainConfig.WithEIPsFlags(context.Background(), big.NewInt(int64(blockNr)))
-	state, tds, err := MakePreState(ctx, db, t.json.Pre, blockNr)
+	state, err := MakePreState2(ctx, db, t.json.Pre, blockNr)
 	if err != nil {
 		return fmt.Errorf("error in MakePreState: %v", err)
 	}
-	tds.StartNewBuffer()
 	ret, gasRemaining, err := t.exec(state, vmconfig)
 	// err is not supposed to be checked here, because in VM tests, the failure
 	// is indicated by the absence of the post-condition section.
@@ -119,12 +119,12 @@ func (t *VMTest) Run(vmconfig vm.Config, blockNr uint64) error {
 			}
 		}
 	}
-	roots, err := tds.ComputeTrieRoots()
+	root, err := trie.CalcRoot("test", db)
 	if err != nil {
 		return fmt.Errorf("Error calculating state root: %v", err)
 	}
-	if t.json.PostStateRoot != (common.Hash{}) && roots[len(roots)-1] != t.json.PostStateRoot {
-		return fmt.Errorf("post state root mismatch, got %x, want %x", roots[len(roots)-1], t.json.PostStateRoot)
+	if t.json.PostStateRoot != (common.Hash{}) && root != t.json.PostStateRoot {
+		return fmt.Errorf("post state root mismatch, got %x, want %x", root, t.json.PostStateRoot)
 	}
 	if logs := rlpHash(state.Logs()); logs != common.Hash(t.json.Logs) {
 		return fmt.Errorf("post state logs hash mismatch: got %x, want %x", logs, t.json.Logs)
@@ -148,21 +148,23 @@ func (t *VMTest) newEVM(state vm.IntraBlockState, vmconfig vm.Config) *vm.EVM {
 		}
 		return core.CanTransfer(db, address, amount)
 	}
+	txContext := vm.TxContext{
+		Origin:   t.json.Exec.Origin,
+		GasPrice: t.json.Exec.GasPrice,
+	}
 	transfer := func(db vm.IntraBlockState, sender, recipient common.Address, amount *uint256.Int, bailout bool) {}
-	context := vm.Context{
+	context := vm.BlockContext{
 		CanTransfer: canTransfer,
 		Transfer:    transfer,
 		GetHash:     vmTestBlockHash,
-		Origin:      t.json.Exec.Origin,
 		Coinbase:    t.json.Env.Coinbase,
 		BlockNumber: new(big.Int).SetUint64(t.json.Env.Number),
 		Time:        new(big.Int).SetUint64(t.json.Env.Timestamp),
 		GasLimit:    t.json.Env.GasLimit,
 		Difficulty:  t.json.Env.Difficulty,
-		GasPrice:    t.json.Exec.GasPrice,
 	}
 	vmconfig.NoRecursion = true
-	return vm.NewEVM(context, state, params.MainnetChainConfig, vmconfig)
+	return vm.NewEVM(context, txContext, state, params.MainnetChainConfig, vmconfig)
 }
 
 func vmTestBlockHash(n uint64) common.Hash {

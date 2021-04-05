@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"testing"
+
 	"github.com/ledgerwatch/turbo-geth/common"
 	"github.com/ledgerwatch/turbo-geth/common/dbutils"
-	"testing"
+	"github.com/stretchr/testify/require"
 )
 
 //func TestSnapshotGet(t *testing.T) {
@@ -331,11 +333,14 @@ import (
 func TestSnapshot2Get(t *testing.T) {
 	sn1 := NewLMDB().WithBucketsConfig(func(defaultBuckets dbutils.BucketsCfg) dbutils.BucketsCfg {
 		return dbutils.BucketsCfg{
-			dbutils.HeaderPrefix: dbutils.BucketConfigItem{},
+			dbutils.HeadersBucket: dbutils.BucketConfigItem{},
 		}
 	}).InMem().MustOpen()
-	err := sn1.Update(context.Background(), func(tx Tx) error {
-		bucket := tx.Cursor(dbutils.HeaderPrefix)
+	err := sn1.Update(context.Background(), func(tx RwTx) error {
+		bucket, err := tx.RwCursor(dbutils.HeadersBucket)
+		if err != nil {
+			return err
+		}
 		innerErr := bucket.Put(dbutils.HeaderKey(1, common.Hash{1}), []byte{1})
 		if innerErr != nil {
 			return innerErr
@@ -356,8 +361,9 @@ func TestSnapshot2Get(t *testing.T) {
 			dbutils.BlockBodyPrefix: dbutils.BucketConfigItem{},
 		}
 	}).InMem().MustOpen()
-	err = sn2.Update(context.Background(), func(tx Tx) error {
-		bucket := tx.Cursor(dbutils.BlockBodyPrefix)
+	err = sn2.Update(context.Background(), func(tx RwTx) error {
+		bucket, err := tx.RwCursor(dbutils.BlockBodyPrefix)
+		require.NoError(t, err)
 		innerErr := bucket.Put(dbutils.BlockBodyKey(1, common.Hash{1}), []byte{1})
 		if innerErr != nil {
 			return innerErr
@@ -374,8 +380,11 @@ func TestSnapshot2Get(t *testing.T) {
 	}
 
 	mainDB := NewLMDB().InMem().MustOpen()
-	err = mainDB.Update(context.Background(), func(tx Tx) error {
-		bucket := tx.Cursor(dbutils.HeaderPrefix)
+	err = mainDB.Update(context.Background(), func(tx RwTx) error {
+		bucket, err := tx.RwCursor(dbutils.HeadersBucket)
+		if err != nil {
+			return err
+		}
 		innerErr := bucket.Put(dbutils.HeaderKey(2, common.Hash{2}), []byte{22})
 		if innerErr != nil {
 			return innerErr
@@ -385,7 +394,11 @@ func TestSnapshot2Get(t *testing.T) {
 			return innerErr
 		}
 
-		bucket = tx.Cursor(dbutils.BlockBodyPrefix)
+		bucket, err = tx.RwCursor(dbutils.BlockBodyPrefix)
+		if err != nil {
+			return err
+		}
+
 		innerErr = bucket.Put(dbutils.BlockBodyKey(2, common.Hash{2}), []byte{22})
 		if innerErr != nil {
 			return innerErr
@@ -401,15 +414,15 @@ func TestSnapshot2Get(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	kv := NewSnapshot2KV().DB(mainDB).SnapshotDB([]string{dbutils.HeaderPrefix}, sn1).
+	kv := NewSnapshot2KV().DB(mainDB).SnapshotDB([]string{dbutils.HeadersBucket}, sn1).
 		SnapshotDB([]string{dbutils.BlockBodyPrefix}, sn2).MustOpen()
 
-	tx, err := kv.Begin(context.Background(), RO)
+	tx, err := kv.BeginRo(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	v, err := tx.GetOne(dbutils.HeaderPrefix, dbutils.HeaderKey(1, common.Hash{1}))
+	v, err := tx.GetOne(dbutils.HeadersBucket, dbutils.HeaderKey(1, common.Hash{1}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -417,7 +430,7 @@ func TestSnapshot2Get(t *testing.T) {
 		t.Fatal(v)
 	}
 
-	v, err = tx.GetOne(dbutils.HeaderPrefix, dbutils.HeaderKey(2, common.Hash{2}))
+	v, err = tx.GetOne(dbutils.HeadersBucket, dbutils.HeaderKey(2, common.Hash{2}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -425,7 +438,7 @@ func TestSnapshot2Get(t *testing.T) {
 		t.Fatal(v)
 	}
 
-	v, err = tx.GetOne(dbutils.HeaderPrefix, dbutils.HeaderKey(3, common.Hash{3}))
+	v, err = tx.GetOne(dbutils.HeadersBucket, dbutils.HeaderKey(3, common.Hash{3}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -457,44 +470,35 @@ func TestSnapshot2Get(t *testing.T) {
 		t.Fatal(v)
 	}
 
-	headerCursor := tx.Cursor(dbutils.HeaderPrefix)
+	headerCursor, err := tx.Cursor(dbutils.HeadersBucket)
+	require.NoError(t, err)
 	k, v, err := headerCursor.Last()
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	if !(bytes.Equal(dbutils.HeaderKey(3, common.Hash{3}), k) && bytes.Equal(v, []byte{33})) {
 		t.Fatal(k, v)
 	}
 	k, v, err = headerCursor.First()
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	if !(bytes.Equal(dbutils.HeaderKey(1, common.Hash{1}), k) && bytes.Equal(v, []byte{1})) {
 		t.Fatal(k, v)
 	}
 
 	k, v, err = headerCursor.Next()
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	if !(bytes.Equal(dbutils.HeaderKey(2, common.Hash{2}), k) && bytes.Equal(v, []byte{22})) {
 		t.Fatal(k, v)
 	}
 
 	k, v, err = headerCursor.Next()
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	if !(bytes.Equal(dbutils.HeaderKey(3, common.Hash{3}), k) && bytes.Equal(v, []byte{33})) {
 		t.Fatal(k, v)
 	}
 
 	k, v, err = headerCursor.Next()
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	if !(bytes.Equal([]byte{}, k) && bytes.Equal(v, []byte{})) {
 		t.Fatal(k, v)
@@ -504,24 +508,27 @@ func TestSnapshot2Get(t *testing.T) {
 func TestSnapshot2WritableTxAndGet(t *testing.T) {
 	sn1 := NewLMDB().WithBucketsConfig(func(defaultBuckets dbutils.BucketsCfg) dbutils.BucketsCfg {
 		return dbutils.BucketsCfg{
-			dbutils.HeaderPrefix: dbutils.BucketConfigItem{},
+			dbutils.HeadersBucket: dbutils.BucketConfigItem{},
 		}
 	}).InMem().MustOpen()
-	err := sn1.Update(context.Background(), func(tx Tx) error {
-		bucket := tx.Cursor(dbutils.HeaderPrefix)
-		innerErr := bucket.Put(dbutils.HeaderKey(1, common.Hash{1}), []byte{1})
-		if innerErr != nil {
-			return innerErr
-		}
-		innerErr = bucket.Put(dbutils.HeaderKey(2, common.Hash{2}), []byte{2})
-		if innerErr != nil {
-			return innerErr
-		}
+	{
+		err := sn1.Update(context.Background(), func(tx RwTx) error {
+			bucket, err := tx.RwCursor(dbutils.HeadersBucket)
+			require.NoError(t, err)
+			innerErr := bucket.Put(dbutils.HeaderKey(1, common.Hash{1}), []byte{1})
+			if innerErr != nil {
+				return innerErr
+			}
+			innerErr = bucket.Put(dbutils.HeaderKey(2, common.Hash{2}), []byte{2})
+			if innerErr != nil {
+				return innerErr
+			}
 
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	sn2 := NewLMDB().WithBucketsConfig(func(defaultBuckets dbutils.BucketsCfg) dbutils.BucketsCfg {
@@ -529,77 +536,63 @@ func TestSnapshot2WritableTxAndGet(t *testing.T) {
 			dbutils.BlockBodyPrefix: dbutils.BucketConfigItem{},
 		}
 	}).InMem().MustOpen()
-	err = sn2.Update(context.Background(), func(tx Tx) error {
-		bucket := tx.Cursor(dbutils.BlockBodyPrefix)
-		innerErr := bucket.Put(dbutils.BlockBodyKey(1, common.Hash{1}), []byte{1})
-		if innerErr != nil {
-			return innerErr
-		}
-		innerErr = bucket.Put(dbutils.BlockBodyKey(2, common.Hash{2}), []byte{2})
-		if innerErr != nil {
-			return innerErr
-		}
+	{
+		err := sn2.Update(context.Background(), func(tx RwTx) error {
+			bucket, err := tx.RwCursor(dbutils.BlockBodyPrefix)
+			require.NoError(t, err)
+			innerErr := bucket.Put(dbutils.BlockBodyKey(1, common.Hash{1}), []byte{1})
+			if innerErr != nil {
+				return innerErr
+			}
+			innerErr = bucket.Put(dbutils.BlockBodyKey(2, common.Hash{2}), []byte{2})
+			if innerErr != nil {
+				return innerErr
+			}
 
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
+			return nil
+		})
+		require.NoError(t, err)
 	}
 
 	mainDB := NewLMDB().InMem().MustOpen()
 
-	kv := NewSnapshot2KV().DB(mainDB).SnapshotDB([]string{dbutils.HeaderPrefix}, sn1).
+	kv := NewSnapshot2KV().DB(mainDB).SnapshotDB([]string{dbutils.HeadersBucket}, sn1).
 		SnapshotDB([]string{dbutils.BlockBodyPrefix}, sn2).MustOpen()
-	tx, err := kv.Begin(context.Background(), RW)
-	if err != nil {
-		t.Fatal(err)
-	}
+	{
+		tx, err := kv.BeginRw(context.Background())
+		require.NoError(t, err)
 
-	v, err := tx.GetOne(dbutils.HeaderPrefix, dbutils.HeaderKey(1, common.Hash{1}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(v, []byte{1}) {
-		t.Fatal(v)
-	}
+		v, err := tx.GetOne(dbutils.HeadersBucket, dbutils.HeaderKey(1, common.Hash{1}))
+		require.NoError(t, err)
+		if !bytes.Equal(v, []byte{1}) {
+			t.Fatal(v)
+		}
 
-	v, err = tx.GetOne(dbutils.BlockBodyPrefix, dbutils.BlockBodyKey(1, common.Hash{1}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(v, []byte{1}) {
-		t.Fatal(v)
-	}
+		v, err = tx.GetOne(dbutils.BlockBodyPrefix, dbutils.BlockBodyKey(1, common.Hash{1}))
+		require.NoError(t, err)
+		if !bytes.Equal(v, []byte{1}) {
+			t.Fatal(v)
+		}
 
-	err = tx.Cursor(dbutils.BlockBodyPrefix).Put(dbutils.BlockBodyKey(4, common.Hash{4}), []byte{4})
-	if err != nil {
-		t.Fatal(err)
+		err = tx.Put(dbutils.BlockBodyPrefix, dbutils.BlockBodyKey(4, common.Hash{4}), []byte{4})
+		require.NoError(t, err)
+		err = tx.Put(dbutils.HeadersBucket, dbutils.HeaderKey(4, common.Hash{4}), []byte{4})
+		require.NoError(t, err)
+		err = tx.Commit()
+		require.NoError(t, err)
 	}
-	err = tx.Cursor(dbutils.HeaderPrefix).Put(dbutils.HeaderKey(4, common.Hash{4}), []byte{4})
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = tx.Commit(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	tx, err = kv.Begin(context.Background(), RO)
-	if err != nil {
-		t.Fatal(err)
-	}
-	c := tx.Cursor(dbutils.HeaderPrefix)
+	tx, err := kv.BeginRo(context.Background())
+	require.NoError(t, err)
+	c, err := tx.Cursor(dbutils.HeadersBucket)
+	require.NoError(t, err)
 	k, v, err := c.First()
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	if !bytes.Equal(k, dbutils.HeaderKey(1, common.Hash{1})) {
 		t.Fatal(k, v)
 	}
 
 	k, v, err = c.Next()
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	if !bytes.Equal(k, dbutils.HeaderKey(2, common.Hash{2})) {
 		t.Fatal(common.Bytes2Hex(k))
 	}
@@ -608,9 +601,7 @@ func TestSnapshot2WritableTxAndGet(t *testing.T) {
 	}
 
 	k, v, err = c.Next()
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	if !bytes.Equal(k, dbutils.HeaderKey(4, common.Hash{4})) {
 		t.Fatal("invalid key", common.Bytes2Hex(k))
 	}
@@ -623,19 +614,16 @@ func TestSnapshot2WritableTxAndGet(t *testing.T) {
 		t.Fatal(k, v, err)
 	}
 
-	c = tx.Cursor(dbutils.BlockBodyPrefix)
+	c, err = tx.Cursor(dbutils.BlockBodyPrefix)
+	require.NoError(t, err)
 	k, v, err = c.First()
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	if !bytes.Equal(k, dbutils.BlockBodyKey(1, common.Hash{1})) {
 		t.Fatal(k, v)
 	}
 
 	k, v, err = c.Next()
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	if !bytes.Equal(k, dbutils.BlockBodyKey(2, common.Hash{2})) {
 		t.Fatal()
 	}
@@ -644,9 +632,7 @@ func TestSnapshot2WritableTxAndGet(t *testing.T) {
 	}
 
 	k, v, err = c.Next()
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	if !bytes.Equal(k, dbutils.BlockBodyKey(4, common.Hash{4})) {
 		t.Fatal()
 	}
@@ -679,12 +665,13 @@ func TestSnapshot2WritableTxWalkReplaceAndCreateNewKey(t *testing.T) {
 	kv := NewSnapshot2KV().DB(mainDB).SnapshotDB([]string{dbutils.PlainStateBucket}, snapshotDB).
 		MustOpen()
 
-	tx, err := kv.Begin(context.Background(), RW)
+	tx, err := kv.BeginRw(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	c := tx.Cursor(dbutils.PlainStateBucket)
+	c, err := tx.RwCursor(dbutils.PlainStateBucket)
+	require.NoError(t, err)
 	replaceKey := dbutils.PlainGenerateCompositeStorageKey([]byte{2}, 1, []byte{4})
 	replaceValue := []byte{2, 4, 4}
 	newKey := dbutils.PlainGenerateCompositeStorageKey([]byte{2}, 1, []byte{5})
@@ -747,13 +734,15 @@ func TestSnapshot2WritableTxWalkAndDeleteKey(t *testing.T) {
 	kv := NewSnapshot2KV().DB(mainDB).SnapshotDB([]string{dbutils.PlainStateBucket}, snapshotDB).
 		MustOpen()
 
-	tx, err := kv.Begin(context.Background(), RW)
+	tx, err := kv.BeginRw(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	c := tx.Cursor(dbutils.PlainStateBucket)
-	deleteCursor := tx.Cursor(dbutils.PlainStateBucket)
+	c, err := tx.Cursor(dbutils.PlainStateBucket)
+	require.NoError(t, err)
+	deleteCursor, err := tx.RwCursor(dbutils.PlainStateBucket)
+	require.NoError(t, err)
 
 	//get first correct k&v
 	k, v, err := c.First()
@@ -820,13 +809,15 @@ func TestSnapshot2WritableTxNextAndPrevAndDeleteKey(t *testing.T) {
 	kv := NewSnapshot2KV().DB(mainDB).SnapshotDB([]string{dbutils.PlainStateBucket}, snapshotDB).
 		MustOpen()
 
-	tx, err := kv.Begin(context.Background(), RW)
+	tx, err := kv.BeginRw(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	c := tx.Cursor(dbutils.PlainStateBucket)
-	deleteCursor := tx.Cursor(dbutils.PlainStateBucket)
+	c, err := tx.Cursor(dbutils.PlainStateBucket)
+	require.NoError(t, err)
+	deleteCursor, err := tx.RwCursor(dbutils.PlainStateBucket)
+	require.NoError(t, err)
 
 	//get first correct k&v
 	k, v, err := c.Last()
@@ -924,12 +915,13 @@ func TestSnapshot2WritableTxWalkLastElementIsSnapshot(t *testing.T) {
 	kv := NewSnapshot2KV().DB(mainDB).SnapshotDB([]string{dbutils.PlainStateBucket}, snapshotDB).
 		MustOpen()
 
-	tx, err := kv.Begin(context.Background(), RW)
+	tx, err := kv.BeginRw(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	c := tx.Cursor(dbutils.PlainStateBucket)
+	c, err := tx.Cursor(dbutils.PlainStateBucket)
+	require.NoError(t, err)
 	//get first correct k&v
 	k, v, err := c.First()
 	if err != nil {
@@ -1007,12 +999,13 @@ func TestSnapshot2WritableTxWalkForwardAndBackward(t *testing.T) {
 	kv := NewSnapshot2KV().DB(mainDB).SnapshotDB([]string{dbutils.PlainStateBucket}, snapshotDB).
 		MustOpen()
 
-	tx, err := kv.Begin(context.Background(), RW)
+	tx, err := kv.BeginRw(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	c := tx.Cursor(dbutils.PlainStateBucket)
+	c, err := tx.Cursor(dbutils.PlainStateBucket)
+	require.NoError(t, err)
 	//get first correct k&v
 	k, v, err := c.First()
 	if err != nil {
@@ -1103,12 +1096,14 @@ func TestSnapshot2WalkByEmptyDB(t *testing.T) {
 	kv := NewSnapshot2KV().DB(mainDB).SnapshotDB([]string{dbutils.PlainStateBucket}, snapshotDB).
 		MustOpen()
 
-	tx, err := kv.Begin(context.Background(), RW)
+	tx, err := kv.BeginRw(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	c := tx.Cursor(dbutils.PlainStateBucket)
+	c, err := tx.Cursor(dbutils.PlainStateBucket)
+	require.NoError(t, err)
+
 	i := 0
 	err = Walk(c, []byte{}, 0, func(k, v []byte) (bool, error) {
 		fmt.Println(common.Bytes2Hex(k), " => ", common.Bytes2Hex(v))
@@ -1139,12 +1134,10 @@ func TestSnapshot2WritablePrevAndDeleteKey(t *testing.T) {
 	kv := NewSnapshot2KV().DB(mainDB).SnapshotDB([]string{dbutils.PlainStateBucket}, snapshotDB).
 		MustOpen()
 
-	tx, err := kv.Begin(context.Background(), RW)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	c := tx.Cursor(dbutils.PlainStateBucket)
+	tx, err := kv.BeginRw(context.Background())
+	require.NoError(t, err)
+	c, err := tx.Cursor(dbutils.PlainStateBucket)
+	require.NoError(t, err)
 
 	//get first correct k&v
 	k, v, err := c.First()
@@ -1156,15 +1149,11 @@ func TestSnapshot2WritablePrevAndDeleteKey(t *testing.T) {
 
 	for i := 1; i < len(data); i++ {
 		k, v, err = c.Next()
-		if err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, err)
 		checkKV(t, k, v, data[i].K, data[i].V)
 
 		k, v, err = c.Current()
-		if err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, err)
 		checkKV(t, k, v, data[i].K, data[i].V)
 	}
 
@@ -1207,13 +1196,12 @@ func TestSnapshot2WritableTxNextAndPrevWithDeleteAndPutKeys(t *testing.T) {
 	kv := NewSnapshot2KV().DB(mainDB).SnapshotDB([]string{dbutils.PlainStateBucket}, snapshotDB).
 		MustOpen()
 
-	tx, err := kv.Begin(context.Background(), RW)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	c := tx.Cursor(dbutils.PlainStateBucket)
-	deleteCursor := tx.Cursor(dbutils.PlainStateBucket)
+	tx, err := kv.BeginRw(context.Background())
+	require.NoError(t, err)
+	c, err := tx.Cursor(dbutils.PlainStateBucket)
+	require.NoError(t, err)
+	deleteCursor, err := tx.RwCursor(dbutils.PlainStateBucket)
+	require.NoError(t, err)
 
 	//get first correct k&v
 	k, v, err := c.First()
@@ -1281,13 +1269,16 @@ func TestSnapshot2WritableTxNextAndPrevWithDeleteAndPutKeys(t *testing.T) {
 
 }
 
-func printBucket(kv KV, bucket string) {
+func printBucket(kv RwKV, bucket string) {
 	fmt.Println("+Print bucket", bucket)
 	defer func() {
 		fmt.Println("-Print bucket", bucket)
 	}()
 	err := kv.View(context.Background(), func(tx Tx) error {
-		c := tx.Cursor(bucket)
+		c, err := tx.Cursor(bucket)
+		if err != nil {
+			return err
+		}
 		k, v, err := c.First()
 		if err != nil {
 			panic(fmt.Errorf("first err: %w", err))

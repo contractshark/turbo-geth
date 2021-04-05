@@ -40,11 +40,12 @@ func createTestDb() (ethdb.Database, error) {
 				address2: {Balance: big.NewInt(300000000000000000)},
 			},
 		}
+		chainId = big.NewInt(1337)
 		// this code generates a log
 		signer = types.HomesteadSigner{}
 	)
 	// Create intermediate hash bucket since it is mandatory now
-	_, genesisHash, _, err := core.SetupGenesisBlock(db, gspec, true, false)
+	_, genesisHash, err := core.SetupGenesisBlock(db, gspec, true, false)
 	if err != nil {
 		return nil, err
 	}
@@ -53,9 +54,9 @@ func createTestDb() (ethdb.Database, error) {
 	engine := ethash.NewFaker()
 
 	contractBackend := backends.NewSimulatedBackendWithConfig(gspec.Alloc, gspec.Config, gspec.GasLimit)
-	transactOpts := bind.NewKeyedTransactor(key)
-	transactOpts1 := bind.NewKeyedTransactor(key1)
-	transactOpts2 := bind.NewKeyedTransactor(key2)
+	transactOpts, _ := bind.NewKeyedTransactorWithChainID(key, chainId)
+	transactOpts1, _ := bind.NewKeyedTransactorWithChainID(key1, chainId)
+	transactOpts2, _ := bind.NewKeyedTransactorWithChainID(key2, chainId)
 	var poly *contracts.Poly
 
 	var tokenContract *contracts.Token
@@ -180,4 +181,14 @@ func createTestDb() (ethdb.Database, error) {
 	}
 
 	return db, nil
+}
+
+func createTestKV() (ethdb.RwKV, error) {
+	db, err := createTestDb()
+
+	if err != nil {
+		return nil, err
+	}
+
+	return db.(ethdb.HasRwKV).RwKV(), nil
 }

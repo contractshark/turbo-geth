@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/ledgerwatch/turbo-geth/cmd/utils"
+	"github.com/ledgerwatch/turbo-geth/core"
 	"github.com/ledgerwatch/turbo-geth/ethdb"
 	"github.com/ledgerwatch/turbo-geth/internal/debug"
 	"github.com/ledgerwatch/turbo-geth/log"
@@ -72,7 +73,7 @@ func RootCommand() (*cobra.Command, *Flags) {
 	rootCmd.PersistentFlags().StringSliceVar(&cfg.HttpCORSDomain, "http.corsdomain", []string{}, "Comma separated list of domains from which to accept cross origin requests (browser enforced)")
 	rootCmd.PersistentFlags().StringSliceVar(&cfg.HttpVirtualHost, "http.vhosts", node.DefaultConfig.HTTPVirtualHosts, "Comma separated list of virtual hostnames from which to accept requests (server enforced). Accepts '*' wildcard.")
 	rootCmd.PersistentFlags().StringSliceVar(&cfg.API, "http.api", []string{"eth", "tg"}, "API's offered over the HTTP-RPC interface")
-	rootCmd.PersistentFlags().Uint64Var(&cfg.Gascap, "rpc.gascap", 0, "Sets a cap on gas that can be used in eth_call/estimateGas")
+	rootCmd.PersistentFlags().Uint64Var(&cfg.Gascap, "rpc.gascap", 25000000, "Sets a cap on gas that can be used in eth_call/estimateGas")
 	rootCmd.PersistentFlags().Uint64Var(&cfg.MaxTraces, "trace.maxtraces", 200, "Sets a limit on traces that can be returned in trace_filter")
 	rootCmd.PersistentFlags().StringVar(&cfg.TraceType, "trace.type", "parity", "Specify the type of tracing [geth|parity*] (experimental)")
 	rootCmd.PersistentFlags().BoolVar(&cfg.WebsocketEnabled, "ws", false, "Enable Websockets")
@@ -85,17 +86,18 @@ func RootCommand() (*cobra.Command, *Flags) {
 	return rootCmd, cfg
 }
 
-func OpenDB(cfg Flags) (ethdb.KV, ethdb.Backend, error) {
-	var db ethdb.KV
-	var ethBackend ethdb.Backend
+func OpenDB(cfg Flags) (ethdb.RoKV, core.ApiBackend, error) {
+	var db ethdb.RwKV
+	var ethBackend core.ApiBackend
 	var err error
 	// Do not change the order of these checks. Chaindata needs to be checked first, because PrivateApiAddr has default value which is not ""
 	// If PrivateApiAddr is checked first, the Chaindata option will never work
 	if cfg.Chaindata != "" {
 		if database, errOpen := ethdb.Open(cfg.Chaindata, true); errOpen == nil {
-			db = database.KV()
+			db = database.RwKV()
 		} else {
 			err = errOpen
+			_ = err
 		}
 		if cfg.SnapshotMode != "" {
 			mode, innerErr := snapshotsync.SnapshotModeFromString(cfg.SnapshotMode)
@@ -110,20 +112,17 @@ func OpenDB(cfg Flags) (ethdb.KV, ethdb.Backend, error) {
 		}
 	}
 	if cfg.PrivateApiAddr != "" {
-		var remoteDb ethdb.KV
-		remoteDb, ethBackend, err = ethdb.NewRemote().Path(cfg.PrivateApiAddr).Open(cfg.TLSCertfile, cfg.TLSKeyFile, cfg.TLSCACert)
+		var remoteKv ethdb.RwKV
+		remoteKv, err = ethdb.NewRemote().Path(cfg.PrivateApiAddr).Open(cfg.TLSCertfile, cfg.TLSKeyFile, cfg.TLSCACert)
 		if err != nil {
-			return nil, nil, fmt.Errorf("could not connect to remoteDb: %w", err)
+			return nil, nil, fmt.Errorf("could not connect to remoteKv: %w", err)
 		}
+		ethBackend = core.NewRemoteBackend(remoteKv)
 		if db == nil {
-			db = remoteDb
+			db = remoteKv
 		}
 	} else {
 		return nil, nil, fmt.Errorf("either remote db or lmdb must be specified")
-	}
-
-	if err != nil {
-		return nil, nil, fmt.Errorf("could not connect to remoteDb: %w", err)
 	}
 
 	return db, ethBackend, err

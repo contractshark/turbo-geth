@@ -96,7 +96,7 @@ var (
 	}
 	aliasFlag = cli.StringFlag{
 		Name:  "alias",
-		Usage: "Comma separated aliases for function and event renaming, e.g. foo=bar",
+		Usage: "Comma separated aliases for function and event renaming, e.g. original1=alias1, original2=alias2",
 	}
 )
 
@@ -117,7 +117,7 @@ func init() {
 		langFlag,
 		aliasFlag,
 	}
-	app.Action = utils.MigrateFlags(abigen)
+	app.Action = abigen
 	cli.CommandHelpTemplate = flags.OriginCommandHelpTemplate
 }
 

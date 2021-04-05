@@ -135,20 +135,28 @@ func FromDBFormat(addrSize int) func(dbKey, dbValue []byte) (blockN uint64, k, v
 	}
 }
 
-func Walk(db ethdb.Database, bucket string, startkey []byte, fixedbits int, walker func(blockN uint64, k, v []byte) (bool, error)) error {
+func Walk(db ethdb.Tx, bucket string, startkey []byte, fixedbits int, walker func(blockN uint64, k, v []byte) (bool, error)) error {
 	fromDBFormat := FromDBFormat(Mapper[bucket].KeySize)
 	var blockN uint64
-	return db.Walk(bucket, startkey, fixedbits, func(k, v []byte) (bool, error) {
+	c, err := db.Cursor(bucket)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	return ethdb.Walk(c, startkey, fixedbits, func(k, v []byte) (bool, error) {
 		blockN, k, v = fromDBFormat(k, v)
 		return walker(blockN, k, v)
 	})
 }
 
-func Truncate(tx ethdb.Tx, from uint64) error {
+func Truncate(tx ethdb.RwTx, from uint64) error {
 	keyStart := dbutils.EncodeBlockNumber(from)
 
 	{
-		c := tx.CursorDupSort(dbutils.PlainAccountChangeSetBucket)
+		c, err := tx.RwCursorDupSort(dbutils.PlainAccountChangeSetBucket)
+		if err != nil {
+			return err
+		}
 		defer c.Close()
 		for k, _, err := c.Seek(keyStart); k != nil; k, _, err = c.NextNoDup() {
 			if err != nil {
@@ -161,7 +169,10 @@ func Truncate(tx ethdb.Tx, from uint64) error {
 		}
 	}
 	{
-		c := tx.CursorDupSort(dbutils.PlainStorageChangeSetBucket)
+		c, err := tx.RwCursorDupSort(dbutils.PlainStorageChangeSetBucket)
+		if err != nil {
+			return err
+		}
 		defer c.Close()
 		for k, _, err := c.Seek(keyStart); k != nil; k, _, err = c.NextNoDup() {
 			if err != nil {
