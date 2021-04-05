@@ -8,9 +8,8 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/ledgerwatch/lmdb-go/lmdb"
-
 	"github.com/c2h5oh/datasize"
+	"github.com/ledgerwatch/lmdb-go/lmdb"
 	"github.com/ledgerwatch/turbo-geth/cmd/utils"
 	"github.com/ledgerwatch/turbo-geth/common/dbutils"
 	"github.com/ledgerwatch/turbo-geth/core/rawdb"
@@ -25,10 +24,8 @@ import (
 func init() {
 	withChaindata(cmdSnapshotCheck)
 	withBlock(cmdSnapshotCheck)
+	withBatchSize(cmdSnapshotCheck)
 	cmdSnapshotCheck.Flags().StringVar(&tmpDBPath, "tmp_db", "", "path to temporary db(for debug)")
-	withChaindata(dbCopyCmd)
-	rootCmd.AddCommand(dbCopyCmd)
-	rootCmd.AddCommand(cmdSnapshotCheck)
 }
 
 var tmpDBPath string
@@ -85,7 +82,7 @@ var cmdSnapshotCheck = &cobra.Command{
 
 		kv := ethdb.NewSnapshot2KV().
 			DB(tmpDb).
-			SnapshotDB([]string{dbutils.HeaderPrefix, dbutils.BlockBodyPrefix, dbutils.Senders, dbutils.HeadBlockKey, dbutils.HeaderNumberPrefix}, mainDB.KV()).
+			SnapshotDB([]string{dbutils.HeadersBucket, dbutils.HeaderCanonicalBucket, dbutils.HeaderTDBucket, dbutils.BlockBodyPrefix, dbutils.Senders, dbutils.HeadBlockKey, dbutils.HeaderNumberBucket}, mainDB.KV()).
 			SnapshotDB([]string{dbutils.PlainStateBucket, dbutils.CodeBucket, dbutils.PlainContractCodeBucket}, stateSnapshot).
 			MustOpen()
 
@@ -149,7 +146,7 @@ func snapshotCheck(ctx context.Context, db ethdb.Database, isNew bool, tmpDir st
 			return fmt.Errorf("promote state err: %w", err)
 		}
 		tt = time.Now()
-		_, err = tx.Commit()
+		err = tx.Commit()
 		if err != nil {
 			tx.Rollback()
 			return fmt.Errorf("commit promote state err: %w", err)
@@ -178,14 +175,14 @@ func snapshotCheck(ctx context.Context, db ethdb.Database, isNew bool, tmpDir st
 		expectedRootHash := syncHeadHeader.Root
 
 		tt := time.Now()
-		err = stagedsync.RegenerateIntermediateHashes("", tx, true, nil, tmpDir, expectedRootHash, ctx.Done())
+		_, err = stagedsync.RegenerateIntermediateHashes("", tx, true, nil, tmpDir, expectedRootHash, ctx.Done())
 		if err != nil {
 			tx.Rollback()
 			return fmt.Errorf("regenerateIntermediateHashes err: %w", err)
 		}
 		log.Info("RegenerateIntermediateHashes took", "t", time.Since(tt))
 		tt = time.Now()
-		_, err = tx.Commit()
+		err = tx.Commit()
 		if err != nil {
 			tx.Rollback()
 			return err
@@ -193,7 +190,7 @@ func snapshotCheck(ctx context.Context, db ethdb.Database, isNew bool, tmpDir st
 		log.Info("Commit", "t", time.Since(tt))
 	}
 
-	cc, bc, st, progress := newSync(ctx.Done(), db, db, nil)
+	cc, bc, _, st, _, cache, progress := newSync(ctx.Done(), db, db, nil)
 	defer bc.Stop()
 	st.DisableStages(stages.Headers,
 		stages.BlockHashes,
@@ -234,6 +231,7 @@ func snapshotCheck(ctx context.Context, db ethdb.Database, isNew bool, tmpDir st
 	}
 
 	ch := ctx.Done()
+
 	var batchSize datasize.ByteSize
 	must(batchSize.UnmarshalText([]byte(batchSizeStr)))
 
@@ -259,6 +257,7 @@ func snapshotCheck(ctx context.Context, db ethdb.Database, isNew bool, tmpDir st
 				ToBlock:       blockNumber, // limit execution to the specified block
 				WriteReceipts: false,
 				BatchSize:     batchSize,
+				Cache:         cache,
 			})
 		if err != nil {
 			return fmt.Errorf("execution err %w", err)
@@ -275,7 +274,7 @@ func snapshotCheck(ctx context.Context, db ethdb.Database, isNew bool, tmpDir st
 		stage6 := progress(stages.IntermediateHashes)
 		stage6.BlockNumber = blockNumber - 1
 		log.Info("Stage6", "progress", stage6.BlockNumber)
-		if err = stagedsync.SpawnIntermediateHashesStage(stage5, tx, true, nil, tmpDir, ch); err != nil {
+		if _, err = stagedsync.SpawnIntermediateHashesStage(stage5, tx, true, nil, tmpDir, ch); err != nil {
 			log.Error("Error on ih", "err", err, "block", blockNumber)
 			return fmt.Errorf("spawnIntermediateHashesStage %w", err)
 		}
@@ -289,11 +288,4 @@ func snapshotCheck(ctx context.Context, db ethdb.Database, isNew bool, tmpDir st
 	}
 
 	return nil
-}
-
-var dbCopyCmd = &cobra.Command{
-	Use: "copy_compact",
-	RunE: func(cmd *cobra.Command, args []string) error {
-		return copyCompact()
-	},
 }

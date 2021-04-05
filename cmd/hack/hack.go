@@ -827,7 +827,8 @@ func printFullNodeRLPs() {
 }
 
 func testDifficulty() {
-	genesisBlock, _, _, err := core.DefaultGenesisBlock().ToBlock(nil, false /* history */)
+	db := ethdb.NewMemDatabase()
+	genesisBlock, _, err := core.DefaultGenesisBlock().ToBlock(db, false /* history */)
 	tool.Check(err)
 	genesisHeader := genesisBlock.Header()
 	d1 := ethash.CalcDifficulty(params.MainnetChainConfig, 100000, genesisHeader.Time, genesisHeader.Difficulty, genesisHeader.Number, genesisHeader.UncleHash)
@@ -1029,8 +1030,8 @@ func repairCurrent() {
 	currentDb := ethdb.MustOpen("statedb")
 	defer currentDb.Close()
 	tool.Check(historyDb.ClearBuckets(dbutils.HashedStorageBucket))
-	tool.Check(historyDb.KV().Update(context.Background(), func(tx ethdb.Tx) error {
-		newB := tx.Cursor(dbutils.HashedStorageBucket)
+	tool.Check(historyDb.KV().Update(context.Background(), func(tx ethdb.RwTx) error {
+		newB := tx.RwCursor(dbutils.HashedStorageBucket)
 		count := 0
 		if err := currentDb.KV().View(context.Background(), func(ctx ethdb.Tx) error {
 			c := ctx.Cursor(dbutils.HashedStorageBucket)
@@ -1170,7 +1171,7 @@ func (r *Receiver) Receive(
 	accountValue *accounts.Account,
 	storageValue []byte,
 	hash []byte,
-	hasBranch bool,
+	hasTree bool,
 	cutoff int,
 ) error {
 	for r.currentIdx < len(r.unfurlList) {
@@ -1186,19 +1187,19 @@ func (r *Receiver) Receive(
 			c = -1
 		}
 		if c > 0 {
-			return r.defaultReceiver.Receive(itemType, accountKey, storageKey, accountValue, storageValue, hash, hasBranch, cutoff)
+			return r.defaultReceiver.Receive(itemType, accountKey, storageKey, accountValue, storageValue, hash, hasTree, cutoff)
 		}
 		if len(k) > common.HashLength {
 			v := r.storageMap[ks]
 			if len(v) > 0 {
-				if err := r.defaultReceiver.Receive(trie.StorageStreamItem, nil, k, nil, v, nil, hasBranch, 0); err != nil {
+				if err := r.defaultReceiver.Receive(trie.StorageStreamItem, nil, k, nil, v, nil, hasTree, 0); err != nil {
 					return err
 				}
 			}
 		} else {
 			v := r.accountMap[ks]
 			if v != nil {
-				if err := r.defaultReceiver.Receive(trie.AccountStreamItem, k, nil, v, nil, nil, hasBranch, 0); err != nil {
+				if err := r.defaultReceiver.Receive(trie.AccountStreamItem, k, nil, v, nil, nil, hasTree, 0); err != nil {
 					return err
 				}
 			}
@@ -1209,7 +1210,7 @@ func (r *Receiver) Receive(
 		}
 	}
 	// We ran out of modifications, simply pass through
-	return r.defaultReceiver.Receive(itemType, accountKey, storageKey, accountValue, storageValue, hash, hasBranch, cutoff)
+	return r.defaultReceiver.Receive(itemType, accountKey, storageKey, accountValue, storageValue, hash, hasTree, cutoff)
 }
 
 func (r *Receiver) Result() trie.SubTries {
@@ -1230,7 +1231,8 @@ func regenerate(chaindata string) error {
 	}
 	syncHeadHeader := rawdb.ReadHeader(db, hash, to)
 	expectedRootHash := syncHeadHeader.Root
-	tool.Check(stagedsync.RegenerateIntermediateHashes("", db, true, nil, "", expectedRootHash, nil))
+	_, err = stagedsync.RegenerateIntermediateHashes("", db, true, nil, "", expectedRootHash, nil)
+	tool.Check(err)
 	log.Info("Regeneration ended")
 	return nil
 }
@@ -1501,38 +1503,29 @@ func supply(chaindata string) error {
 func extractCode(chaindata string) error {
 	db := ethdb.MustOpen(chaindata)
 	defer db.Close()
-	destDb := ethdb.MustOpen("codes")
-	defer destDb.Close()
-	return destDb.KV().Update(context.Background(), func(tx1 ethdb.Tx) error {
-		c1 := tx1.Cursor(dbutils.PlainContractCodeBucket)
-		return db.KV().View(context.Background(), func(tx ethdb.Tx) error {
-			c := tx.Cursor(dbutils.PlainContractCodeBucket)
-			for k, v, err := c.First(); k != nil; k, v, err = c.Next() {
-				if err != nil {
-					return err
-				}
-				if err = c1.Append(k, v); err != nil {
-					return err
-				}
+	var contractCount int
+	if err1 := db.KV().View(context.Background(), func(tx ethdb.Tx) error {
+		c := tx.Cursor(dbutils.CodeBucket)
+		// This is a mapping of CodeHash => Byte code
+		for k, v, err := c.First(); k != nil; k, v, err = c.Next() {
+			if err != nil {
+				return err
 			}
-			c1 = tx1.Cursor(dbutils.CodeBucket)
-			c = tx.Cursor(dbutils.CodeBucket)
-			for k, v, err := c.First(); k != nil; k, v, err = c.Next() {
-				if err != nil {
-					return err
-				}
-				if err = c1.Append(k, v); err != nil {
-					return err
-				}
-			}
-			return nil
-		})
-	})
+			fmt.Printf("%x,%x", k, v)
+			contractCount++
+		}
+		return nil
+	}); err1 != nil {
+		return err1
+	}
+	fmt.Fprintf(os.Stderr, "contractCount: %d\n", contractCount)
+	return nil
 }
 
 func iterateOverCode(chaindata string) error {
 	db := ethdb.MustOpen(chaindata)
 	defer db.Close()
+	var contractCount int
 	var contractKeyTotalLength int
 	var contractValTotalLength int
 	var codeHashTotalLength int
@@ -1555,12 +1548,14 @@ func iterateOverCode(chaindata string) error {
 			}
 			codeHashTotalLength += len(k)
 			codeTotalLength += len(v)
+			contractCount++
 		}
 		return nil
 	}); err1 != nil {
 		return err1
 	}
-	fmt.Printf("contractKeyTotalLength: %d, contractValTotalLength: %d, codeHashTotalLength: %d, codeTotalLength: %d\n", contractKeyTotalLength, contractValTotalLength, codeHashTotalLength, codeTotalLength)
+	fmt.Printf("contractCount: %d,contractKeyTotalLength: %d, contractValTotalLength: %d, codeHashTotalLength: %d, codeTotalLength: %d\n",
+		contractCount, contractKeyTotalLength, contractValTotalLength, codeHashTotalLength, codeTotalLength)
 	return nil
 }
 
@@ -1581,16 +1576,13 @@ func mint(chaindata string, block uint64) error {
 	blockEncoded := dbutils.EncodeBlockNumber(block)
 	canonical := make(map[common.Hash]struct{})
 	if err1 := db.KV().View(context.Background(), func(tx ethdb.Tx) error {
-		c := tx.Cursor(dbutils.HeaderPrefix)
+		c := tx.Cursor(dbutils.HeaderCanonicalBucket)
 		// This is a mapping of contractAddress + incarnation => CodeHash
 		for k, v, err := c.Seek(blockEncoded); k != nil; k, v, err = c.Next() {
 			if err != nil {
 				return err
 			}
 			// Skip non relevant records
-			if !dbutils.CheckCanonicalKey(k) {
-				continue
-			}
 			canonical[common.BytesToHash(v)] = struct{}{}
 			if len(canonical)%100_000 == 0 {
 				log.Info("Read canonical hashes", "count", len(canonical))
@@ -1615,7 +1607,10 @@ func mint(chaindata string, block uint64) error {
 			prevBlock = blockNumber
 			body := rawdb.ReadBody(db, blockHash, blockNumber)
 			header := rawdb.ReadHeader(db, blockHash, blockNumber)
-			senders := rawdb.ReadSenders(db, blockHash, blockNumber)
+			senders, errSenders := rawdb.ReadSenders(db, blockHash, blockNumber)
+			if errSenders != nil {
+				return errSenders
+			}
 			var ethSpent uint256.Int
 			var ethSpentTotal uint256.Int
 			var totalGas uint256.Int
@@ -1645,6 +1640,43 @@ func mint(chaindata string, block uint64) error {
 	}); err1 != nil {
 		return err1
 	}
+	return nil
+}
+
+func extractHashes(chaindata string, blockStep uint64, blockTotal uint64, name string) error {
+	db := ethdb.MustOpen(chaindata)
+	defer db.Close()
+
+	f, err := os.Create(fmt.Sprintf("preverified_hashes_%s.go", name))
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	w := bufio.NewWriter(f)
+	defer w.Flush()
+
+	fmt.Fprintf(w, "package headerdownload\n\n")
+	fmt.Fprintf(w, "var %sPreverifiedHashes = []string{\n", name)
+
+	b := uint64(0)
+	for b <= blockTotal {
+		hash, err := rawdb.ReadCanonicalHash(db, b)
+		if err != nil {
+			return err
+		}
+
+		if hash == (common.Hash{}) {
+			break
+		}
+
+		fmt.Fprintf(w, "	\"%x\",\n", hash)
+		b += blockStep
+	}
+	b -= blockStep
+	fmt.Fprintf(w, "}\n\n")
+	fmt.Fprintf(w, "const %sPreverifiedHeight uint64 = %d\n", name, b)
+	fmt.Printf("Last block is %d\n", b)
 	return nil
 }
 
@@ -1988,6 +2020,11 @@ func main() {
 	}
 	if *action == "extractHeaders" {
 		if err := extractHeaders(*chaindata, uint64(*block), uint64(*blockTotal), *name); err != nil {
+			fmt.Printf("Error: %v\n", err)
+		}
+	}
+	if *action == "extractHashes" {
+		if err := extractHashes(*chaindata, uint64(*block), uint64(*blockTotal), *name); err != nil {
 			fmt.Printf("Error: %v\n", err)
 		}
 	}

@@ -9,8 +9,8 @@ import (
 
 	"github.com/ledgerwatch/turbo-geth/common/dbutils"
 	"github.com/ledgerwatch/turbo-geth/ethdb"
-	"github.com/ledgerwatch/turbo-geth/ethdb/remote"
 	"github.com/ledgerwatch/turbo-geth/ethdb/remote/remotedbserver"
+	"github.com/ledgerwatch/turbo-geth/gointerfaces/remote"
 	"github.com/ledgerwatch/turbo-geth/log"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -27,33 +27,33 @@ func TestSequence(t *testing.T) {
 
 	for _, db := range writeDBs {
 		db := db
-		tx, err := db.Begin(ctx, ethdb.RW)
+		tx, err := db.BeginRw(ctx)
 		require.NoError(t, err)
 		defer tx.Rollback()
 
-		i, err := tx.Sequence(dbutils.Buckets[0], 0)
+		i, err := tx.ReadSequence(dbutils.Buckets[0])
 		require.NoError(t, err)
 		require.Equal(t, uint64(0), i)
-		i, err = tx.Sequence(dbutils.Buckets[0], 1)
+		i, err = tx.IncrementSequence(dbutils.Buckets[0], 1)
 		require.NoError(t, err)
 		require.Equal(t, uint64(0), i)
-		i, err = tx.Sequence(dbutils.Buckets[0], 6)
+		i, err = tx.IncrementSequence(dbutils.Buckets[0], 6)
 		require.NoError(t, err)
 		require.Equal(t, uint64(1), i)
-		i, err = tx.Sequence(dbutils.Buckets[0], 1)
+		i, err = tx.IncrementSequence(dbutils.Buckets[0], 1)
 		require.NoError(t, err)
 		require.Equal(t, uint64(7), i)
 
-		i, err = tx.Sequence(dbutils.Buckets[1], 0)
+		i, err = tx.ReadSequence(dbutils.Buckets[1])
 		require.NoError(t, err)
 		require.Equal(t, uint64(0), i)
-		i, err = tx.Sequence(dbutils.Buckets[1], 1)
+		i, err = tx.IncrementSequence(dbutils.Buckets[1], 1)
 		require.NoError(t, err)
 		require.Equal(t, uint64(0), i)
-		i, err = tx.Sequence(dbutils.Buckets[1], 6)
+		i, err = tx.IncrementSequence(dbutils.Buckets[1], 6)
 		require.NoError(t, err)
 		require.Equal(t, uint64(1), i)
-		i, err = tx.Sequence(dbutils.Buckets[1], 1)
+		i, err = tx.IncrementSequence(dbutils.Buckets[1], 1)
 		require.NoError(t, err)
 		require.Equal(t, uint64(7), i)
 	}
@@ -87,12 +87,12 @@ func TestManagedTx(t *testing.T) {
 
 	for _, db := range writeDBs {
 		db := db
-		tx, err := db.Begin(ctx, ethdb.RW)
+		tx, err := db.BeginRw(ctx)
 		require.NoError(t, err)
 		defer tx.Rollback()
 
-		c := tx.Cursor(bucket1)
-		c1 := tx.Cursor(bucket2)
+		c := tx.RwCursor(bucket1)
+		c1 := tx.RwCursor(bucket2)
 		require.NoError(t, c.Append([]byte{0}, []byte{1}))
 		require.NoError(t, c1.Append([]byte{0}, []byte{1}))
 		require.NoError(t, c.Append([]byte{0, 0, 0, 0, 0, 1}, []byte{1})) // prefixes of len=FromLen for DupSort test (other keys must be <ToLen)
@@ -142,7 +142,7 @@ func setupDatabases(f ethdb.BucketConfigsFunc) (writeDBs []ethdb.KV, readDBs []e
 
 	conn := bufconn.Listen(1024 * 1024)
 
-	rdb, _ := ethdb.NewRemote().InMem(conn).MustOpen()
+	rdb := ethdb.NewRemote().InMem(conn).MustOpen()
 	readDBs = []ethdb.KV{
 		writeDBs[0],
 		writeDBs[1],
@@ -174,61 +174,6 @@ func setupDatabases(f ethdb.BucketConfigsFunc) (writeDBs []ethdb.KV, readDBs []e
 	}
 }
 
-func testPrefixFilter(t *testing.T, db ethdb.KV, bucket1 string) {
-	assert := assert.New(t)
-
-	if err := db.View(context.Background(), func(tx ethdb.Tx) error {
-		c := tx.Cursor(bucket1).Prefix([]byte{2})
-		counter := 0
-		for k, _, err := c.First(); k != nil; k, _, err = c.Next() {
-			if err != nil {
-				return err
-			}
-			counter++
-		}
-		assert.Equal(1, counter)
-
-		counter = 0
-		if err := ethdb.ForEach(c, func(k, _ []byte) (bool, error) {
-			counter++
-			return true, nil
-		}); err != nil {
-			return err
-		}
-		assert.Equal(1, counter)
-
-		k2, _, err2 := c.Seek([]byte{2})
-		assert.NoError(err2)
-		assert.Equal([]byte{2}, k2)
-
-		c = tx.Cursor(bucket1)
-		counter = 0
-		for k, _, err := c.First(); k != nil; k, _, err = c.Next() {
-			if err != nil {
-				return err
-			}
-			counter++
-		}
-		assert.Equal(13, counter)
-
-		counter = 0
-		if err := ethdb.ForEach(c, func(_, _ []byte) (bool, error) {
-			counter++
-			return true, nil
-		}); err != nil {
-			return err
-		}
-		assert.Equal(13, counter)
-
-		k2, _, err2 = c.Seek([]byte{2})
-		assert.NoError(err2)
-		assert.Equal([]byte{2}, k2)
-		return nil
-	}); err != nil {
-		assert.NoError(err)
-	}
-
-}
 func testCtxCancel(t *testing.T, db ethdb.KV, bucket1 string) {
 	assert := assert.New(t)
 	cancelableCtx, cancel := context.WithTimeout(context.Background(), time.Microsecond)

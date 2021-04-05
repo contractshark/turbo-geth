@@ -166,6 +166,7 @@ Error: %v
 		if lastHeader.Number.Uint64() < *headNumber {
 			newCanonical = true
 		} else if lastHeader.Number.Uint64() == *headNumber {
+			//nolint:gosec
 			newCanonical = mrand.Float64() < 0.5
 		}
 	}
@@ -218,7 +219,7 @@ Error: %v
 		if err := rawdb.WriteTd(batch, header.Hash(), header.Number.Uint64(), td); err != nil {
 			return false, false, 0, fmt.Errorf("[%s] Failed to WriteTd: %w", logPrefix, err)
 		}
-		if err := batch.Put(dbutils.HeaderPrefix, dbutils.HeaderKey(number, header.Hash()), data); err != nil {
+		if err := batch.Put(dbutils.HeadersBucket, dbutils.HeaderKey(number, header.Hash()), data); err != nil {
 			return false, false, 0, fmt.Errorf("[%s] Failed to store header: %w", logPrefix, err)
 		}
 	}
@@ -260,12 +261,14 @@ Error: %v
 	if newCanonical {
 		encoded := dbutils.EncodeBlockNumber(lastHeader.Number.Uint64())
 
-		if err := batch.Put(dbutils.HeaderNumberPrefix, lastHeader.Hash().Bytes(), encoded); err != nil {
-			return false, false, 0, fmt.Errorf("[%s] Failed to store hash to number mapping: %w", logPrefix, err)
+		if err := batch.Put(dbutils.HeaderNumberBucket, lastHeader.Hash().Bytes(), encoded); err != nil {
+			return false, false, 0, fmt.Errorf("[%s] failed to store hash to number mapping: %w", logPrefix, err)
 		}
-		rawdb.WriteHeadHeaderHash(batch, lastHeader.Hash())
+		if err := rawdb.WriteHeadHeaderHash(batch, lastHeader.Hash()); err != nil {
+			return false, false, 0, fmt.Errorf("[%s] failed to write head header hash: %w", logPrefix, err)
+		}
 	}
-	if _, err := batch.Commit(); err != nil {
+	if err := batch.Commit(); err != nil {
 		return false, false, 0, fmt.Errorf("%s: write header markers into disk: %w", logPrefix, err)
 	}
 	// Report some public statistics so the user has a clue what's going on

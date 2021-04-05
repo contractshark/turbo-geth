@@ -3,9 +3,9 @@ package stages
 import (
 	"context"
 	"fmt"
-	"math/big"
 	"time"
 
+	"github.com/holiman/uint256"
 	"github.com/ledgerwatch/turbo-geth/common"
 	"github.com/ledgerwatch/turbo-geth/core"
 	"github.com/ledgerwatch/turbo-geth/core/vm"
@@ -13,8 +13,13 @@ import (
 	"github.com/ledgerwatch/turbo-geth/eth/stagedsync/stages"
 	"github.com/ledgerwatch/turbo-geth/ethdb"
 	"github.com/ledgerwatch/turbo-geth/log"
+	"github.com/ledgerwatch/turbo-geth/params"
 	"github.com/ledgerwatch/turbo-geth/turbo/stages/bodydownload"
 	"github.com/ledgerwatch/turbo-geth/turbo/stages/headerdownload"
+)
+
+const (
+	logInterval = 30 * time.Second
 )
 
 // StageLoop runs the continuous loop of staged sync
@@ -23,36 +28,27 @@ func StageLoop(
 	db ethdb.Database,
 	hd *headerdownload.HeaderDownload,
 	bd *bodydownload.BodyDownload,
-	headerReqSend func(context.Context, []*headerdownload.HeaderRequest),
+	chainConfig *params.ChainConfig,
+	headerReqSend func(context.Context, *headerdownload.HeaderRequest) []byte,
 	bodyReqSend func(context.Context, *bodydownload.BodyRequest) []byte,
 	penalise func(context.Context, []byte),
-	updateHead func(context.Context, uint64, common.Hash, *big.Int),
+	updateHead func(context.Context, uint64, common.Hash, *uint256.Int),
 	wakeUpChan chan struct{},
 	timeout int,
 ) error {
-	if _, _, _, err := core.SetupGenesisBlock(db, core.DefaultGenesisBlock(), false /* history */, false /* overwrite */); err != nil {
-		return fmt.Errorf("setup genesis block: %w", err)
-	}
 	sync := stagedsync.New(
 		ReplacementStages(ctx, hd, bd, headerReqSend, bodyReqSend, penalise, updateHead, wakeUpChan, timeout),
 		ReplacementUnwindOrder(),
 		stagedsync.OptionalParameters{},
 	)
-	for {
-		var ready bool
-		var height uint64
-		// Keep requesting more headers until there is a heaviest chain
-		for ready, height = hd.Ready(); !ready; ready, height = hd.Ready() {
-			reqs, timer := hd.RequestMoreHeaders(uint64(time.Now().Unix()), 5 /*timeout */)
-			headerReqSend(ctx, reqs)
-			select {
-			case <-ctx.Done(): // When terminate signal is sent or Ctrl-C is pressed
-				return nil
-			case <-timer.C: // When it is time to check on previously sent requests
-			case <-wakeUpChan: // When new message comes from the sentry
-			case <-hd.StageReadyChannel(): // When heaviest chain is ready
-			}
-		}
+	initialCycle := true
+	stopped := false
+	for !stopped {
+		logEvery := time.NewTicker(logInterval)
+		defer logEvery.Stop()
+
+		// Estimate the current top height seen from the peer
+		height := hd.TopSeenHeight()
 
 		origin, err := stages.GetStageProgress(db, stages.Headers)
 		if err != nil {
@@ -82,12 +78,9 @@ func StageLoop(
 		cc := &core.TinyChainContext{}
 		cc.SetDB(tx)
 		//cc.SetEngine(d.blockchain.Engine())
-		st, err1 := sync.Prepare(nil, nil /* chainConfig */, cc, &vm.Config{}, db, writeDB, "downloader", ethdb.DefaultStorageMode, ".", nil, 512*1024*1024, make(chan struct{}), nil, nil, func() error { return nil }, nil)
+		st, err1 := sync.Prepare(nil, chainConfig, cc, &vm.Config{}, db, writeDB, "downloader", ethdb.DefaultStorageMode, ".", nil, 512*1024*1024, make(chan struct{}), nil, nil, func() error { return nil }, initialCycle, nil)
 		if err1 != nil {
 			return fmt.Errorf("prepare staged sync: %w", err1)
-		}
-		if err != nil {
-			return err
 		}
 
 		// begin tx at stage right after head/body download Or at first unwind stage
@@ -125,7 +118,7 @@ func StageLoop(
 				return nil
 			}
 			log.Info("Commit cycle")
-			_, errCommit := tx.Commit()
+			errCommit := tx.Commit()
 			return errCommit
 		})
 
@@ -136,7 +129,7 @@ func StageLoop(
 		if canRunCycleInOneTransaction {
 			if hasTx, ok := tx.(ethdb.HasTx); !ok || hasTx.Tx() != nil {
 				commitStart := time.Now()
-				_, errTx := tx.Commit()
+				errTx := tx.Commit()
 				if errTx == nil {
 					log.Info("Commit cycle", "in", time.Since(commitStart))
 				} else {
@@ -144,16 +137,23 @@ func StageLoop(
 				}
 			}
 		}
+		initialCycle = false
+		select {
+		case <-ctx.Done():
+			stopped = true
+		default:
+		}
 	}
+	return nil
 }
 
 func ReplacementStages(ctx context.Context,
 	hd *headerdownload.HeaderDownload,
 	bd *bodydownload.BodyDownload,
-	headerReqSend func(context.Context, []*headerdownload.HeaderRequest),
+	headerReqSend func(context.Context, *headerdownload.HeaderRequest) []byte,
 	bodyReqSend func(context.Context, *bodydownload.BodyRequest) []byte,
 	penalise func(context.Context, []byte),
-	updateHead func(context.Context, uint64, common.Hash, *big.Int),
+	updateHead func(context.Context, uint64, common.Hash, *uint256.Int),
 	wakeUpChan chan struct{},
 	timeout int,
 ) stagedsync.StageBuilders {
@@ -165,10 +165,10 @@ func ReplacementStages(ctx context.Context,
 					ID:          stages.Headers,
 					Description: "Download headers",
 					ExecFunc: func(s *stagedsync.StageState, u stagedsync.Unwinder) error {
-						return stagedsync.HeadersForward(s, ctx, world.TX, hd)
+						return stagedsync.HeadersForward(s, u, ctx, world.TX, hd, world.ChainConfig, headerReqSend, world.InitialCycle, wakeUpChan, world.BatchSize)
 					},
 					UnwindFunc: func(u *stagedsync.UnwindState, s *stagedsync.StageState) error {
-						return u.Done(world.TX)
+						return stagedsync.HeadersUnwind(u, s, world.TX)
 					},
 				}
 			},
@@ -183,7 +183,7 @@ func ReplacementStages(ctx context.Context,
 						return stagedsync.SpawnBlockHashStage(s, world.TX, world.TmpDir, world.QuitCh)
 					},
 					UnwindFunc: func(u *stagedsync.UnwindState, s *stagedsync.StageState) error {
-						return u.Done(world.TX)
+						return u.Done(world.DB)
 					},
 				}
 			},
@@ -195,10 +195,10 @@ func ReplacementStages(ctx context.Context,
 					ID:          stages.Bodies,
 					Description: "Download block bodies",
 					ExecFunc: func(s *stagedsync.StageState, u stagedsync.Unwinder) error {
-						return stagedsync.BodiesForward(s, ctx, world.TX, bd, bodyReqSend, penalise, updateHead, wakeUpChan, timeout)
+						return stagedsync.BodiesForward(s, ctx, world.TX, bd, bodyReqSend, penalise, updateHead, wakeUpChan, timeout, world.BatchSize)
 					},
 					UnwindFunc: func(u *stagedsync.UnwindState, s *stagedsync.StageState) error {
-						return u.Done(world.TX)
+						return u.Done(world.DB)
 					},
 				}
 			},

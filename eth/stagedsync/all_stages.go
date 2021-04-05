@@ -27,10 +27,10 @@ func createStageBuilders(blocks []*types.Block, blockNum uint64, checkRoot bool)
 					ID:          stages.BlockHashes,
 					Description: "Write block hashes",
 					ExecFunc: func(s *StageState, u Unwinder) error {
-						return SpawnBlockHashStage(s, world.db, world.TmpDir, world.QuitCh)
+						return SpawnBlockHashStage(s, world.DB, world.TmpDir, world.QuitCh)
 					},
 					UnwindFunc: func(u *UnwindState, s *StageState) error {
-						return u.Done(world.db)
+						return u.Done(world.DB)
 					},
 				}
 			},
@@ -48,7 +48,7 @@ func createStageBuilders(blocks []*types.Block, blockNum uint64, checkRoot bool)
 						return s.DoneAndUpdate(world.TX, blockNum)
 					},
 					UnwindFunc: func(u *UnwindState, s *StageState) error {
-						return u.Done(world.db)
+						return u.Done(world.DB)
 					},
 				}
 			},
@@ -72,7 +72,7 @@ func createStageBuilders(blocks []*types.Block, blockNum uint64, checkRoot bool)
 							ReadChLen:       4,
 							Now:             time.Now(),
 						}
-						return SpawnRecoverSendersStage(cfg, s, world.TX, world.chainConfig, 0, world.TmpDir, world.QuitCh)
+						return SpawnRecoverSendersStage(cfg, s, world.TX, world.ChainConfig, 0, world.TmpDir, world.QuitCh)
 					},
 					UnwindFunc: func(u *UnwindState, s *StageState) error {
 						return UnwindSendersStage(u, s, world.TX)
@@ -88,24 +88,22 @@ func createStageBuilders(blocks []*types.Block, blockNum uint64, checkRoot bool)
 					Description: "Execute blocks w/o hash checks",
 					ExecFunc: func(s *StageState, u Unwinder) error {
 						return SpawnExecuteBlocksStage(s, world.TX,
-							world.chainConfig, world.chainContext, world.vmConfig,
+							world.ChainConfig, world.chainContext, world.vmConfig,
 							world.QuitCh,
 							ExecuteBlockStageParams{
 								WriteReceipts:         world.storageMode.Receipts,
 								Cache:                 world.cache,
-								BatchSize:             world.batchSize,
-								ChangeSetHook:         world.changeSetHook,
+								BatchSize:             world.BatchSize,
 								ReaderBuilder:         world.stateReaderBuilder,
 								WriterBuilder:         world.stateWriterBuilder,
 								SilkwormExecutionFunc: world.silkwormExecutionFunc,
 							})
 					},
 					UnwindFunc: func(u *UnwindState, s *StageState) error {
-						return UnwindExecutionStage(u, s, world.TX, ExecuteBlockStageParams{
+						return UnwindExecutionStage(u, s, world.TX, world.QuitCh, ExecuteBlockStageParams{
 							WriteReceipts:         world.storageMode.Receipts,
 							Cache:                 world.cache,
-							BatchSize:             world.batchSize,
-							ChangeSetHook:         world.changeSetHook,
+							BatchSize:             world.BatchSize,
 							ReaderBuilder:         world.stateReaderBuilder,
 							WriterBuilder:         world.stateWriterBuilder,
 							SilkwormExecutionFunc: world.silkwormExecutionFunc,
@@ -153,6 +151,8 @@ func createStageBuilders(blocks []*types.Block, blockNum uint64, checkRoot bool)
 								}
 							}
 							c.Close()
+						*/
+						/*
 							c = world.TX.(ethdb.HasTx).Tx().Cursor(dbutils.CurrentStateBucket)
 							for k, v, err := c.First(); k != nil; k, v, err = c.Next() {
 								if err != nil {
@@ -169,7 +169,8 @@ func createStageBuilders(blocks []*types.Block, blockNum uint64, checkRoot bool)
 							}
 							c.Close()
 						*/
-						return SpawnIntermediateHashesStage(s, world.TX, checkRoot /* checkRoot */, world.cache, world.TmpDir, world.QuitCh)
+						_, err := SpawnIntermediateHashesStage(s, world.TX, checkRoot /* checkRoot */, world.cache, world.TmpDir, world.QuitCh)
+						return err
 					},
 					UnwindFunc: func(u *UnwindState, s *StageState) error {
 						return UnwindIntermediateHashesStage(u, s, world.TX, world.cache, world.TmpDir, world.QuitCh)
@@ -237,17 +238,17 @@ func createStageBuilders(blocks []*types.Block, blockNum uint64, checkRoot bool)
 					Disabled:            !world.storageMode.CallTraces,
 					DisabledDescription: "Work In Progress",
 					ExecFunc: func(s *StageState, u Unwinder) error {
-						return SpawnCallTraces(s, world.TX, world.chainConfig, world.chainContext, world.TmpDir, world.QuitCh,
+						return SpawnCallTraces(s, world.TX, world.ChainConfig, world.chainContext, world.TmpDir, world.QuitCh,
 							CallTracesStageParams{
 								Cache:     world.cache,
-								BatchSize: world.batchSize,
+								BatchSize: world.BatchSize,
 							})
 					},
 					UnwindFunc: func(u *UnwindState, s *StageState) error {
-						return UnwindCallTraces(u, s, world.TX, world.chainConfig, world.chainContext, world.QuitCh,
+						return UnwindCallTraces(u, s, world.TX, world.ChainConfig, world.chainContext, world.QuitCh,
 							CallTracesStageParams{
 								Cache:     world.cache,
-								BatchSize: world.batchSize,
+								BatchSize: world.BatchSize,
 							})
 					},
 				}
@@ -285,7 +286,7 @@ func createStageBuilders(blocks []*types.Block, blockNum uint64, checkRoot bool)
 						logPrefix := s.state.LogPrefix()
 						log.Info(fmt.Sprintf("[%s] Update current block for the RPC API", logPrefix), "to", executionAt)
 
-						err = NotifyRpcDaemon(s.BlockNumber+1, executionAt, world.notifier, world.TX)
+						err = NotifyNewHeaders(s.BlockNumber+1, executionAt, world.notifier, world.TX)
 						if err != nil {
 							return err
 						}
@@ -339,6 +340,7 @@ func SetHead(db ethdb.Database, config *params.ChainConfig, vmConfig *vm.Config,
 		nil,
 		nil,
 		nil,
+		false,
 		nil,
 	)
 	if err1 != nil {
@@ -396,7 +398,7 @@ func InsertBlocksInStages(db ethdb.Database, storageMode ethdb.StorageMode, conf
 		if _, err = core.InsertBodyChain("Bodies", context.Background(), tx, blocks, false /* newCanonical */); err != nil {
 			return false, fmt.Errorf("inserting block bodies chain for non-canonical chain")
 		}
-		if _, err1 = tx.Commit(); err1 != nil {
+		if err1 = tx.Commit(); err1 != nil {
 			return false, fmt.Errorf("committing transaction after importing blocks: %v", err1)
 		}
 		return false, nil // No change of the chain
@@ -427,10 +429,10 @@ func InsertBlocksInStages(db ethdb.Database, storageMode ethdb.StorageMode, conf
 		nil,
 		nil,
 		nil,
+		false,
 		nil,
 	)
 	if err2 != nil {
-		panic(err2)
 		return false, err2
 	}
 
@@ -442,7 +444,7 @@ func InsertBlocksInStages(db ethdb.Database, storageMode ethdb.StorageMode, conf
 	if err = syncState.Run(tx, tx); err != nil {
 		return false, err
 	}
-	if _, err1 = tx.Commit(); err1 != nil {
+	if err1 = tx.Commit(); err1 != nil {
 		return false, fmt.Errorf("committing transaction after importing blocks: %v", err1)
 	}
 	return true, nil

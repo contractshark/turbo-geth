@@ -45,7 +45,7 @@ func SpawnLogIndex(s *StageState, db ethdb.Database, tmpdir string, quit <-chan 
 	endBlock, err := s.ExecutionAt(tx)
 	logPrefix := s.state.LogPrefix()
 	if err != nil {
-		return fmt.Errorf("%s: logs index: getting last executed block: %w", logPrefix, err)
+		return fmt.Errorf("%s: getting last executed block: %w", logPrefix, err)
 	}
 	if endBlock == s.BlockNumber {
 		s.Done()
@@ -65,7 +65,7 @@ func SpawnLogIndex(s *StageState, db ethdb.Database, tmpdir string, quit <-chan 
 		return err
 	}
 	if !useExternalTx {
-		if _, err := tx.Commit(); err != nil {
+		if err := tx.Commit(); err != nil {
 			return err
 		}
 	}
@@ -226,7 +226,7 @@ func UnwindLogIndex(u *UnwindState, s *StageState, db ethdb.Database, quitCh <-c
 	}
 
 	if !useExternalTx {
-		if _, err := tx.Commit(); err != nil {
+		if err := tx.Commit(); err != nil {
 			return err
 		}
 	}
@@ -307,14 +307,4 @@ func truncateBitmaps(tx ethdb.Database, bucket string, inMem map[string]struct{}
 	}
 
 	return nil
-}
-
-func SendBitmapsByChunks(k []byte, m *roaring.Bitmap, buf *bytes.Buffer, next etl.LoadNextFunc) error {
-	return bitmapdb.WalkChunkWithKeys(k, m, bitmapdb.ChunkLimit, func(chunkKey []byte, chunk *roaring.Bitmap) error {
-		buf.Reset()
-		if _, err := chunk.WriteTo(buf); err != nil {
-			return err
-		}
-		return next(k, chunkKey, buf.Bytes())
-	})
 }

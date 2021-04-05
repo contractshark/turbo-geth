@@ -1,7 +1,10 @@
-FROM golang:1.15-alpine3.12 as builder
+FROM golang:1.16-alpine3.13 as builder
 
 ARG git_commit
 ENV GIT_COMMIT=$git_commit
+
+ARG git_branch
+ENV GIT_BRANCH=$git_branch
 
 # for linters to avoid warnings. we won't use linters in Docker anyway
 ENV LATEST_COMMIT="undefined"
@@ -17,7 +20,7 @@ RUN go mod download
 ADD . .
 RUN make all
 
-FROM alpine:3.12
+FROM alpine:3.13
 
 RUN apk add --no-cache ca-certificates libgcc libstdc++
 COPY --from=builder /app/build/bin/* /usr/local/bin/

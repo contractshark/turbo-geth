@@ -3,10 +3,11 @@ package stagedsync
 import (
 	"context"
 	"fmt"
-	"math/big"
 	"runtime"
 	"time"
 
+	"github.com/c2h5oh/datasize"
+	"github.com/holiman/uint256"
 	"github.com/ledgerwatch/turbo-geth/common"
 	"github.com/ledgerwatch/turbo-geth/core/rawdb"
 	"github.com/ledgerwatch/turbo-geth/eth/stagedsync/stages"
@@ -23,8 +24,10 @@ func BodiesForward(
 	bd *bodydownload.BodyDownload,
 	bodyReqSend func(context.Context, *bodydownload.BodyRequest) []byte,
 	penalise func(context.Context, []byte),
-	updateHead func(ctx context.Context, head uint64, hash common.Hash, td *big.Int),
-	wakeUpChan chan struct{}, timeout int) error {
+	updateHead func(ctx context.Context, head uint64, hash common.Hash, td *uint256.Int),
+	wakeUpChan chan struct{},
+	timeout int,
+	batchSize datasize.ByteSize) error {
 	var tx ethdb.DbWithPendingMutations
 	var err error
 	var useExternalTx bool
@@ -51,6 +54,12 @@ func BodiesForward(
 	if err != nil {
 		return err
 	}
+	penalties := true
+	if headerProgress-bodyProgress <= 16 {
+		// When processing small number of blocks, we can afford wasting more bandwidth but get blocks quicker
+		timeout = 1
+		penalties = false
+	}
 	logPrefix := s.LogPrefix()
 	log.Info(fmt.Sprintf("[%s] Processing bodies...", logPrefix), "from", bodyProgress, "to", headerProgress)
 	batch := tx.NewBatch()
@@ -67,10 +76,14 @@ func BodiesForward(
 	var headHash common.Hash
 	var headSet bool
 	for !stopped {
-		penaltyPeers := bd.GetPenaltyPeers()
-		for _, penaltyPeer := range penaltyPeers {
-			penalise(ctx, penaltyPeer)
-		}
+		/*
+			if penalties {
+				penaltyPeers := bd.GetPenaltyPeers()
+				for _, penaltyPeer := range penaltyPeers {
+					penalise(ctx, penaltyPeer)
+				}
+			}
+		*/
 		if req == nil {
 			currentTime := uint64(time.Now().Unix())
 			req, blockNum = bd.RequestMoreBodies(db, blockNum, currentTime)
@@ -79,13 +92,25 @@ func BodiesForward(
 		if req != nil {
 			peer = bodyReqSend(ctx, req)
 		}
-		for req != nil && peer != nil {
+		if req != nil && peer != nil {
+			if !penalties {
+				log.Info("Sent", "req", fmt.Sprintf("[%d-%d]", req.BlockNums[0], req.BlockNums[len(req.BlockNums)-1]), "peer", string(peer))
+			}
 			currentTime := uint64(time.Now().Unix())
 			bd.RequestSent(req, currentTime+uint64(timeout), peer)
+		}
+		for req != nil && peer != nil {
+			currentTime := uint64(time.Now().Unix())
 			req, blockNum = bd.RequestMoreBodies(db, blockNum, currentTime)
 			peer = nil
 			if req != nil {
 				peer = bodyReqSend(ctx, req)
+			}
+			if req != nil && peer != nil {
+				if !penalties {
+					log.Info("Sent", "req", fmt.Sprintf("[%d-%d]", req.BlockNums[0], req.BlockNums[len(req.BlockNums)-1]), "peer", string(peer))
+				}
+				bd.RequestSent(req, currentTime+uint64(timeout), peer)
 			}
 		}
 		d := bd.GetDeliveries()
@@ -103,7 +128,8 @@ func BodiesForward(
 				rawdb.WriteHeadBlockHash(batch, headHash)
 				headSet = true
 			}
-			if batch.BatchSize() >= batch.IdealBatchSize() {
+
+			if batch.BatchSize() >= int(batchSize) {
 				if err = batch.CommitAndBegin(context.Background()); err != nil {
 					return err
 				}
@@ -128,19 +154,20 @@ func BodiesForward(
 			logProgressBodies(logPrefix, bodyProgress, prevDeliveredCount, deliveredCount, prevWastedCount, wastedCount, batch)
 			prevDeliveredCount = deliveredCount
 			prevWastedCount = wastedCount
-			bd.PrintPeerMap()
 		case <-timer.C:
 		//log.Info("RequestQueueTime (bodies) ticked")
 		case <-wakeUpChan:
 			//log.Info("bodyLoop woken up by the incoming request")
 		}
 	}
-	if _, err := batch.Commit(); err != nil {
+	if err := batch.Commit(); err != nil {
 		return fmt.Errorf("%s: failed to write batch commit: %v", logPrefix, err)
 	}
 	if headSet {
 		if headTd, err := rawdb.ReadTd(tx, headHash, bodyProgress); err == nil {
-			updateHead(ctx, bodyProgress, headHash, headTd)
+			headTd256 := new(uint256.Int)
+			headTd256.SetFromBig(headTd)
+			updateHead(ctx, bodyProgress, headHash, headTd256)
 		} else {
 			log.Error("Failed to get total difficulty", "hash", headHash, "height", bodyProgress, "error", err)
 		}
@@ -149,7 +176,7 @@ func BodiesForward(
 		return err
 	}
 	if !useExternalTx {
-		if _, err := tx.Commit(); err != nil {
+		if err := tx.Commit(); err != nil {
 			return err
 		}
 	}

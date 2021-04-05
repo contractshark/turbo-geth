@@ -69,7 +69,7 @@ func SpawnCallTraces(s *StageState, db ethdb.Database, chainConfig *params.Chain
 		return err
 	}
 	if !useExternalTx {
-		if _, err := tx.Commit(); err != nil {
+		if err := tx.Commit(); err != nil {
 			return err
 		}
 	}
@@ -144,7 +144,10 @@ func promoteCallTraces(logPrefix string, tx ethdb.Database, startBlock, endBlock
 		if block == nil {
 			break
 		}
-		senders := rawdb.ReadSenders(tx, blockHash, blockNum)
+		senders, errSenders := rawdb.ReadSenders(tx, blockHash, blockNum)
+		if errSenders != nil {
+			return errSenders
+		}
 		block.Body().SendersToTxs(senders)
 
 		var stateReader state.StateReader
@@ -263,7 +266,7 @@ func UnwindCallTraces(u *UnwindState, s *StageState, db ethdb.Database, chainCon
 	}
 
 	if !useExternalTx {
-		if _, err := tx.Commit(); err != nil {
+		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("[%s] %w", logPrefix, err)
 		}
 	}
@@ -292,7 +295,10 @@ func unwindCallTraces(logPrefix string, db ethdb.Database, from, to uint64, chai
 		if block == nil {
 			break
 		}
-		senders := rawdb.ReadSenders(db, blockHash, blockNum)
+		senders, errSenders := rawdb.ReadSenders(db, blockHash, blockNum)
+		if errSenders != nil {
+			return errSenders
+		}
 		block.Body().SendersToTxs(senders)
 
 		stateReader := state.NewCachedReader(state.NewPlainDBState(db, blockNum-1), cache)
@@ -343,11 +349,11 @@ func NewCallTracer() *CallTracer {
 func (ct *CallTracer) CaptureStart(depth int, from common.Address, to common.Address, precompile bool, create bool, calltype vm.CallType, input []byte, gas uint64, value *big.Int) error {
 	return nil
 }
-func (ct *CallTracer) CaptureState(env *vm.EVM, pc uint64, op vm.OpCode, gas, cost uint64, memory *vm.Memory, stack *stack.Stack, _ *stack.ReturnStack, rData []byte, contract *vm.Contract, depth int, err error) error {
+func (ct *CallTracer) CaptureState(env *vm.EVM, pc uint64, op vm.OpCode, gas, cost uint64, memory *vm.Memory, stack *stack.Stack, rData []byte, contract *vm.Contract, depth int, err error) error {
 	//TODO: Populate froms and tos if it is any call opcode
 	return nil
 }
-func (ct *CallTracer) CaptureFault(env *vm.EVM, pc uint64, op vm.OpCode, gas, cost uint64, memory *vm.Memory, stack *stack.Stack, _ *stack.ReturnStack, contract *vm.Contract, depth int, err error) error {
+func (ct *CallTracer) CaptureFault(env *vm.EVM, pc uint64, op vm.OpCode, gas, cost uint64, memory *vm.Memory, stack *stack.Stack, contract *vm.Contract, depth int, err error) error {
 	return nil
 }
 func (ct *CallTracer) CaptureEnd(depth int, output []byte, gasUsed uint64, t time.Duration, err error) error {

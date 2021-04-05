@@ -9,12 +9,13 @@ import (
 	"github.com/ledgerwatch/turbo-geth/ethdb"
 	"github.com/ledgerwatch/turbo-geth/params"
 	"github.com/ledgerwatch/turbo-geth/turbo/shards"
+	"github.com/ledgerwatch/turbo-geth/turbo/stages/bodydownload"
 )
 
 const prof = false // whether to profile
 
 type StagedSync struct {
-	PrefetchedBlocks *PrefetchedBlocks
+	PrefetchedBlocks *bodydownload.PrefetchedBlocks
 	stageBuilders    StageBuilders
 	unwindOrder      UnwindOrder
 	params           OptionalParameters
@@ -40,7 +41,7 @@ type OptionalParameters struct {
 
 func New(stages StageBuilders, unwindOrder UnwindOrder, params OptionalParameters) *StagedSync {
 	return &StagedSync{
-		PrefetchedBlocks: NewPrefetchedBlocks(),
+		PrefetchedBlocks: bodydownload.NewPrefetchedBlocks(),
 		stageBuilders:    stages,
 		unwindOrder:      unwindOrder,
 		params:           params,
@@ -63,7 +64,8 @@ func (stagedSync *StagedSync) Prepare(
 	headersFetchers []func() error,
 	txPool *core.TxPool,
 	poolStart func() error,
-	changeSetHook ChangeSetHook,
+	initialCycle bool,
+	miningConfig *MiningStagesParameters,
 ) (*State, error) {
 	var readerBuilder StateReaderBuilder
 	if stagedSync.params.StateReaderBuilder != nil {
@@ -82,10 +84,10 @@ func (stagedSync *StagedSync) Prepare(
 	stages := stagedSync.stageBuilders.Build(
 		StageParameters{
 			d:                     d,
-			chainConfig:           chainConfig,
+			ChainConfig:           chainConfig,
 			chainContext:          chainContext,
 			vmConfig:              vmConfig,
-			db:                    db,
+			DB:                    db,
 			TX:                    tx,
 			pid:                   pid,
 			storageMode:           storageMode,
@@ -94,14 +96,15 @@ func (stagedSync *StagedSync) Prepare(
 			headersFetchers:       headersFetchers,
 			txPool:                txPool,
 			poolStart:             poolStart,
-			changeSetHook:         changeSetHook,
 			cache:                 cache,
-			batchSize:             batchSize,
+			BatchSize:             batchSize,
 			prefetchedBlocks:      stagedSync.PrefetchedBlocks,
 			stateReaderBuilder:    readerBuilder,
 			stateWriterBuilder:    writerBuilder,
 			notifier:              stagedSync.Notifier,
 			silkwormExecutionFunc: stagedSync.params.SilkwormExecutionFunc,
+			InitialCycle:          initialCycle,
+			mining:                miningConfig,
 		},
 	)
 	state := NewState(stages)

@@ -37,10 +37,6 @@ type Getter interface {
 	// Get returns the value for a given key if it's present.
 	Get(bucket string, key []byte) ([]byte, error)
 
-	// Get returns prober chunk of index or error if index is not created.
-	// Key must contain 8byte inverted block number in the end.
-	GetIndexChunk(bucket string, key []byte, timestamp uint64) ([]byte, error)
-
 	// Has indicates whether a key exists in the database.
 	Has(bucket string, key []byte) (bool, error)
 
@@ -49,9 +45,6 @@ type Getter interface {
 	// walker is called for each eligible entry.
 	// If walker returns false or an error, the walk stops.
 	Walk(bucket string, startkey []byte, fixedbits int, walker func(k, v []byte) (bool, error)) error
-
-	// MultiWalk is similar to multiple Walk calls folded into one.
-	MultiWalk(bucket string, startkeys [][]byte, fixedbits []int, walker func(int, []byte, []byte) error) error
 }
 
 type GetterPutter interface {
@@ -94,14 +87,12 @@ type Database interface {
 	Begin(ctx context.Context, flags TxFlags) (DbWithPendingMutations, error) // starts db transaction
 	Last(bucket string) ([]byte, []byte, error)
 
-	// IdealBatchSize defines the size of the data batches should ideally add in one write.
-	IdealBatchSize() int
-
 	Keys() ([][]byte, error)
 
 	Append(bucket string, key, value []byte) error
 	AppendDup(bucket string, key, value []byte) error
-	Sequence(bucket string, amount uint64) (uint64, error)
+	IncrementSequence(bucket string, amount uint64) (uint64, error)
+	ReadSequence(bucket string) (uint64, error)
 }
 
 // MinDatabase is a minimalistic version of the Database interface.
@@ -126,7 +117,7 @@ type DbWithPendingMutations interface {
 	// ... some calculations on `tx`
 	// tx.Commit()
 	//
-	Commit() (uint64, error)
+	Commit() error
 
 	// CommitAndBegin - commits and starts new transaction inside same db object.
 	// useful for periodical commits implementation.
@@ -143,10 +134,9 @@ type DbWithPendingMutations interface {
 	// tx.Commit()
 	//
 	CommitAndBegin(ctx context.Context) error
+	RollbackAndBegin(ctx context.Context) error
 	Rollback()
 	BatchSize() int
-
-	Reserve(bucket string, key []byte, i int) ([]byte, error)
 }
 
 type HasKV interface {

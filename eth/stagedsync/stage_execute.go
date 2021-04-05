@@ -60,13 +60,16 @@ func readBlock(blockNum uint64, tx ethdb.Database) (*types.Block, error) {
 	}
 	block := rawdb.ReadBlock(tx, blockHash, blockNum)
 
-	senders := rawdb.ReadSenders(tx, blockHash, blockNum)
+	senders, errSenders := rawdb.ReadSenders(tx, blockHash, blockNum)
+	if errSenders != nil {
+		return nil, errSenders
+	}
 	block.Body().SendersToTxs(senders)
 
 	return block, nil
 }
 
-func executeBlockWithGo(block *types.Block, tx ethdb.DbWithPendingMutations, cache *shards.StateCache, batch ethdb.Database, chainConfig *params.ChainConfig,
+func executeBlockWithGo(block *types.Block, tx ethdb.Database, cache *shards.StateCache, batch ethdb.Database, chainConfig *params.ChainConfig,
 	chainContext core.ChainContext, vmConfig *vm.Config, params ExecuteBlockStageParams) error {
 
 	blockNum := block.NumberU64()
@@ -114,7 +117,6 @@ func executeBlockWithGo(block *types.Block, tx ethdb.DbWithPendingMutations, cac
 }
 
 func SpawnExecuteBlocksStage(s *StageState, stateDB ethdb.Database, chainConfig *params.ChainConfig, chainContext *core.TinyChainContext, vmConfig *vm.Config, quit <-chan struct{}, params ExecuteBlockStageParams) error {
-	params.Cache = nil
 	prevStageProgress, errStart := stages.GetStageProgress(stateDB, stages.Senders)
 	if errStart != nil {
 		return errStart
@@ -260,12 +262,12 @@ func SpawnExecuteBlocksStage(s *StageState, stateDB ethdb.Database, chainConfig 
 			if err := s.Update(batch, stageProgress); err != nil {
 				return err
 			}
-			if _, err := batch.Commit(); err != nil {
+			if err := batch.Commit(); err != nil {
 				return fmt.Errorf("%s: failed to write batch commit: %v", logPrefix, err)
 			}
 		}
 		if !useExternalTx {
-			if _, err := tx.Commit(); err != nil {
+			if err := tx.Commit(); err != nil {
 				return err
 			}
 		}
@@ -278,7 +280,7 @@ func SpawnExecuteBlocksStage(s *StageState, stateDB ethdb.Database, chainConfig 
 			return err
 		}
 		if !useExternalTx {
-			if _, err := tx.Commit(); err != nil {
+			if err := tx.Commit(); err != nil {
 				return err
 			}
 		}
@@ -363,8 +365,7 @@ func logProgress(logPrefix string, prevBlock uint64, prevTime time.Time, current
 	return currentBlock, currentTime
 }
 
-func UnwindExecutionStage(u *UnwindState, s *StageState, stateDB ethdb.Database, params ExecuteBlockStageParams) error {
-	params.Cache = nil
+func UnwindExecutionStage(u *UnwindState, s *StageState, stateDB ethdb.Database, quit <-chan struct{}, params ExecuteBlockStageParams) error {
 	if u.UnwindPoint >= s.BlockNumber {
 		s.Done()
 		return nil
@@ -389,7 +390,7 @@ func UnwindExecutionStage(u *UnwindState, s *StageState, stateDB ethdb.Database,
 	stateBucket := dbutils.PlainStateBucket
 	storageKeyLength := common.AddressLength + common.IncarnationLength + common.HashLength
 
-	accountMap, storageMap, errRewind := changeset.RewindData(tx, s.BlockNumber, u.UnwindPoint)
+	accountMap, storageMap, errRewind := changeset.RewindData(tx, s.BlockNumber, u.UnwindPoint, quit)
 	if errRewind != nil {
 		return fmt.Errorf("%s: getting rewind data: %v", logPrefix, errRewind)
 	}
@@ -437,7 +438,7 @@ func UnwindExecutionStage(u *UnwindState, s *StageState, stateDB ethdb.Database,
 		}
 	}
 
-	if err := changeset.Truncate(tx.(ethdb.HasTx).Tx(), u.UnwindPoint+1); err != nil {
+	if err := changeset.Truncate(tx.(ethdb.HasTx).Tx().(ethdb.RwTx), u.UnwindPoint+1); err != nil {
 		return fmt.Errorf("[%s] %w", logPrefix, err)
 	}
 
@@ -452,7 +453,7 @@ func UnwindExecutionStage(u *UnwindState, s *StageState, stateDB ethdb.Database,
 	}
 
 	if !useExternalTx {
-		if _, err := tx.Commit(); err != nil {
+		if err := tx.Commit(); err != nil {
 			return err
 		}
 	}

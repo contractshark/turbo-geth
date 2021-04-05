@@ -12,7 +12,7 @@ import (
 	"github.com/ledgerwatch/turbo-geth/common/hexutil"
 	"github.com/ledgerwatch/turbo-geth/consensus/ethash"
 	"github.com/ledgerwatch/turbo-geth/core/rawdb"
-	"github.com/ledgerwatch/turbo-geth/eth"
+	"github.com/ledgerwatch/turbo-geth/eth/tracers"
 	"github.com/ledgerwatch/turbo-geth/ethdb"
 	"github.com/ledgerwatch/turbo-geth/ethdb/bitmapdb"
 	"github.com/ledgerwatch/turbo-geth/rpc"
@@ -162,9 +162,9 @@ func (api *TraceAPIImpl) Filter(ctx context.Context, req TraceFilterRequest) (Pa
 		for _, addr := range historyFilter {
 
 			addrBytes := addr.Bytes()
-			blockNumbers, err := retrieveHistory(tx, addr, fromBlock, toBlock)
-			if err != nil {
-				return nil, err
+			blockNumbers, errHistory := retrieveHistory(tx, addr, fromBlock, toBlock)
+			if errHistory != nil {
+				return nil, errHistory
 			}
 
 			for _, num := range blockNumbers {
@@ -172,7 +172,10 @@ func (api *TraceAPIImpl) Filter(ctx context.Context, req TraceFilterRequest) (Pa
 				if err != nil {
 					return nil, err
 				}
-				senders := rawdb.ReadSenders(tx, block.Hash(), num)
+				senders, errSenders := rawdb.ReadSenders(tx, block.Hash(), num)
+				if errSenders != nil {
+					return nil, errSenders
+				}
 				for i, txn := range block.Transactions() {
 					if uint64(len(filteredHashes)) == maxTracesCount {
 						if uint64(len(filteredHashes)) == api.maxTraces {
@@ -294,11 +297,11 @@ func (api *TraceAPIImpl) Filter(ctx context.Context, req TraceFilterRequest) (Pa
 		} else {
 			// In this case, we're processing a transaction hash
 			txn, blockHash, blockNumber, txIndex := rawdb.ReadTransaction(tx, txOrBlockHash)
-			msg, vmctx, ibs, _, err := transactions.ComputeTxEnv(ctx, getter, chainConfig, chainContext, tx.(ethdb.HasTx).Tx(), blockHash, txIndex)
+			msg, blockCtx, txCtx, ibs, _, err := transactions.ComputeTxEnv(ctx, getter, chainConfig, chainContext, tx.(ethdb.HasTx).Tx(), blockHash, txIndex)
 			if err != nil {
 				return nil, err
 			}
-			trace, err := transactions.TraceTx(ctx, msg, vmctx, ibs, &eth.TraceConfig{Tracer: &traceType}, chainConfig)
+			trace, err := transactions.TraceTx(ctx, msg, blockCtx, txCtx, ibs, &tracers.TraceConfig{Tracer: &traceType}, chainConfig)
 			if err != nil {
 				return nil, err
 			}
@@ -308,7 +311,7 @@ func (api *TraceAPIImpl) Filter(ctx context.Context, req TraceFilterRequest) (Pa
 			}
 			var gethTrace GethTrace
 			jsonStr, _ := traceJSON.MarshalJSON()
-			json.Unmarshal(jsonStr, &gethTrace) // nolint errcheck
+			json.Unmarshal(jsonStr, &gethTrace) // nolint:errcheck
 			converted := api.convertToParityTrace(gethTrace, blockHash, blockNumber, txn, txIndex, []int{})
 			traces = append(traces, converted...)
 		}
@@ -365,13 +368,13 @@ func (api *TraceAPIImpl) getTransactionTraces(tx ethdb.Database, ctx context.Con
 	traceType := "callTracer" // nolint: goconst
 
 	txn, blockHash, blockNumber, txIndex := rawdb.ReadTransaction(tx, txHash)
-	msg, vmctx, ibs, _, err := transactions.ComputeTxEnv(ctx, getter, chainConfig, chainContext, tx.(ethdb.HasTx).Tx(), blockHash, txIndex)
+	msg, blockCtx, txCtx, ibs, _, err := transactions.ComputeTxEnv(ctx, getter, chainConfig, chainContext, tx.(ethdb.HasTx).Tx(), blockHash, txIndex)
 	if err != nil {
 		return nil, err
 	}
 
 	// Time spent 176 out of 205
-	trace, err := transactions.TraceTx(ctx, msg, vmctx, ibs, &eth.TraceConfig{Tracer: &traceType}, chainConfig)
+	trace, err := transactions.TraceTx(ctx, msg, blockCtx, txCtx, ibs, &tracers.TraceConfig{Tracer: &traceType}, chainConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -384,7 +387,7 @@ func (api *TraceAPIImpl) getTransactionTraces(tx ethdb.Database, ctx context.Con
 	var gethTrace GethTrace
 	jsonStr, _ := traceJSON.MarshalJSON()
 	// Time spent 26 out of 205
-	json.Unmarshal(jsonStr, &gethTrace) // nolint errcheck
+	json.Unmarshal(jsonStr, &gethTrace) // nolint:errcheck
 
 	traces := ParityTraces{}
 	// Time spent 3 out of 205
