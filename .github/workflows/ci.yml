@@ -26,15 +26,8 @@ jobs:
           key: ${{ matrix.os }}-go-${{ hashFiles('**/go.sum') }}
       - name: Build (non-windows)
         if: matrix.os != 'windows-latest'
-        run: make all
-      - name: Build (windows)
-        if: matrix.os == 'windows-latest'
-        run: |
-          go build -trimpath -o bin/tg.exe ./cmd/tg
-          go build -trimpath -o bin/rpcdaemon.exe ./cmd/rpcdaemon
-          go build -trimpath -o bin/rpctest.exe ./cmd/rpctest
-          go build -trimpath -o bin/integration.exe ./cmd/integration
-          go build -trimpath -o bin/headers.ext ./cmd/headers
+        run: make geth
+
       - name: Lint
         if: matrix.os != 'windows-latest'
         uses: golangci/golangci-lint-action@v2
