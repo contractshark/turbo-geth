@@ -95,14 +95,14 @@ type fetcherTester struct {
 }
 
 // newTester creates a new fetcher test mocker.
-func newTester() *fetcherTester {
+func newTester(light bool) *fetcherTester {
 	tester := &fetcherTester{
 		hashes:  []common.Hash{genesis.Hash()},
 		headers: map[common.Hash]*types.Header{genesis.Hash(): genesis.Header()},
 		blocks:  map[common.Hash]*types.Block{genesis.Hash(): genesis},
 		drops:   make(map[string]bool),
 	}
-	tester.fetcher = NewBlockFetcher(tester.getHeader, tester.getBlock, tester.verifyHeader, tester.broadcastBlock, tester.chainHeight, tester.insertHeaders, tester.insertChain, tester.dropPeer)
+	tester.fetcher = NewBlockFetcher(light, tester.getHeader, tester.getBlock, tester.verifyHeader, tester.broadcastBlock, tester.chainHeight, tester.insertHeaders, tester.insertChain, tester.dropPeer)
 	tester.fetcher.Start()
 
 	return tester
@@ -138,6 +138,9 @@ func (f *fetcherTester) chainHeight() uint64 {
 	f.lock.RLock()
 	defer f.lock.RUnlock()
 
+	if f.fetcher.light {
+		return f.headers[f.hashes[len(f.hashes)-1]].Number.Uint64()
+	}
 	return f.blocks[f.hashes[len(f.hashes)-1]].NumberU64()
 }
 
@@ -319,14 +322,14 @@ func verifyChainHeight(t *testing.T, fetcher *fetcherTester, height uint64) {
 
 // Tests that a fetcher accepts block announcements and initiates retrievals for
 // them, successfully importing into the local chain.
-func TestSequentialAnnouncements(t *testing.T) { testSequentialAnnouncements(t) }
+func TestSequentialAnnouncements(t *testing.T) { testSequentialAnnouncements(t, false) }
 
-func testSequentialAnnouncements(t *testing.T) {
+func testSequentialAnnouncements(t *testing.T, light bool) {
 	// Create a chain of blocks to import
 	targetBlocks := 4 * hashLimit
 	hashes, blocks := makeChain(targetBlocks, 0, genesis)
 
-	tester := newTester()
+	tester := newTester(light)
 	defer tester.fetcher.Stop()
 	headerFetcher := tester.makeHeaderFetcher("valid", blocks, -gatherSlack)
 	bodyFetcher := tester.makeBodyFetcher("valid", blocks, 0)
@@ -334,10 +337,17 @@ func testSequentialAnnouncements(t *testing.T) {
 	// Iteratively announce blocks until all are imported
 	imported := make(chan interface{})
 	tester.fetcher.importedHook = func(header *types.Header, block *types.Block) {
-		if block == nil {
-			t.Fatalf("Fetcher try to import empty block")
+		if light {
+			if header == nil {
+				t.Fatalf("Fetcher try to import empty header")
+			}
+			imported <- header
+		} else {
+			if block == nil {
+				t.Fatalf("Fetcher try to import empty block")
+			}
+			imported <- block
 		}
-		imported <- block
 	}
 	for i := len(hashes) - 2; i >= 0; i-- {
 		tester.fetcher.Notify("valid", hashes[i], uint64(len(hashes)-i-1), time.Now().Add(-arriveTimeout), headerFetcher, bodyFetcher)
@@ -349,15 +359,15 @@ func testSequentialAnnouncements(t *testing.T) {
 
 // Tests that if blocks are announced by multiple peers (or even the same buggy
 // peer), they will only get downloaded at most once.
-func TestConcurrentAnnouncements(t *testing.T) { testConcurrentAnnouncements(t) }
+func TestConcurrentAnnouncements(t *testing.T) { testConcurrentAnnouncements(t, false) }
 
-func testConcurrentAnnouncements(t *testing.T) {
+func testConcurrentAnnouncements(t *testing.T, light bool) {
 	// Create a chain of blocks to import
 	targetBlocks := 4 * hashLimit
 	hashes, blocks := makeChain(targetBlocks, 0, genesis)
 
 	// Assemble a tester with a built in counter for the requests
-	tester := newTester()
+	tester := newTester(light)
 	defer tester.fetcher.Stop()
 	firstHeaderFetcher := tester.makeHeaderFetcher("first", blocks, -gatherSlack)
 	firstBodyFetcher := tester.makeBodyFetcher("first", blocks, 0)
@@ -376,10 +386,17 @@ func testConcurrentAnnouncements(t *testing.T) {
 	// Iteratively announce blocks until all are imported
 	imported := make(chan interface{}, 1)
 	tester.fetcher.importedHook = func(header *types.Header, block *types.Block) {
-		if block == nil {
-			t.Fatalf("Fetcher try to import empty block")
+		if light {
+			if header == nil {
+				t.Fatalf("Fetcher try to import empty header")
+			}
+			imported <- header
+		} else {
+			if block == nil {
+				t.Fatalf("Fetcher try to import empty block")
+			}
+			imported <- block
 		}
-		imported <- block
 	}
 
 	for i := len(hashes) - 2; i >= 0; i-- {
@@ -399,14 +416,14 @@ func testConcurrentAnnouncements(t *testing.T) {
 
 // Tests that announcements arriving while a previous is being fetched still
 // results in a valid import.
-func TestOverlappingAnnouncements(t *testing.T) { testOverlappingAnnouncements(t) }
+func TestOverlappingAnnouncements(t *testing.T) { testOverlappingAnnouncements(t, false) }
 
-func testOverlappingAnnouncements(t *testing.T) {
+func testOverlappingAnnouncements(t *testing.T, light bool) {
 	// Create a chain of blocks to import
 	targetBlocks := 4 * hashLimit
 	hashes, blocks := makeChain(targetBlocks, 0, genesis)
 
-	tester := newTester()
+	tester := newTester(light)
 	defer tester.fetcher.Stop()
 	headerFetcher := tester.makeHeaderFetcher("valid", blocks, -gatherSlack)
 	bodyFetcher := tester.makeBodyFetcher("valid", blocks, 0)
@@ -418,10 +435,17 @@ func testOverlappingAnnouncements(t *testing.T) {
 		imported <- nil
 	}
 	tester.fetcher.importedHook = func(header *types.Header, block *types.Block) {
-		if block == nil {
-			t.Fatalf("Fetcher try to import empty block")
+		if light {
+			if header == nil {
+				t.Fatalf("Fetcher try to import empty header")
+			}
+			imported <- header
+		} else {
+			if block == nil {
+				t.Fatalf("Fetcher try to import empty block")
+			}
+			imported <- block
 		}
-		imported <- block
 	}
 
 	for i := len(hashes) - 2; i >= 0; i-- {
@@ -438,14 +462,14 @@ func testOverlappingAnnouncements(t *testing.T) {
 }
 
 // Tests that announces already being retrieved will not be duplicated.
-func TestPendingDeduplication64(t *testing.T) { testPendingDeduplication(t) }
+func TestPendingDeduplication64(t *testing.T) { testPendingDeduplication(t, false) }
 
-func testPendingDeduplication(t *testing.T) {
+func testPendingDeduplication(t *testing.T, light bool) {
 	// Create a hash and corresponding block
 	hashes, blocks := makeChain(1, 0, genesis)
 
 	// Assemble a tester with a built in counter and delayed fetcher
-	tester := newTester()
+	tester := newTester(light)
 	defer tester.fetcher.Stop()
 	headerFetcher := tester.makeHeaderFetcher("repeater", blocks, -gatherSlack)
 	bodyFetcher := tester.makeBodyFetcher("repeater", blocks, 0)
@@ -465,6 +489,11 @@ func testPendingDeduplication(t *testing.T) {
 	checkNonExist := func() bool {
 		return tester.getBlock(hashes[0]) == nil
 	}
+	if light {
+		checkNonExist = func() bool {
+			return tester.getHeader(hashes[0]) == nil
+		}
+	}
 	// Announce the same block many times until it's fetched (wait for any pending ops)
 	for checkNonExist() {
 		tester.fetcher.Notify("repeater", hashes[0], 1, time.Now().Add(-arriveTimeout), headerWrapper, bodyFetcher)
@@ -481,15 +510,15 @@ func testPendingDeduplication(t *testing.T) {
 
 // Tests that announcements retrieved in a random order are cached and eventually
 // imported when all the gaps are filled in.
-func TestRandomArrivalImport(t *testing.T) { testRandomArrivalImport(t) }
+func TestRandomArrivalImport(t *testing.T) { testRandomArrivalImport(t, false) }
 
-func testRandomArrivalImport(t *testing.T) {
+func testRandomArrivalImport(t *testing.T, light bool) {
 	// Create a chain of blocks to import, and choose one to delay
 	targetBlocks := maxQueueDist
 	hashes, blocks := makeChain(targetBlocks, 0, genesis)
 	skip := targetBlocks / 2
 
-	tester := newTester()
+	tester := newTester(light)
 	defer tester.fetcher.Stop()
 	headerFetcher := tester.makeHeaderFetcher("valid", blocks, -gatherSlack)
 	bodyFetcher := tester.makeBodyFetcher("valid", blocks, 0)
@@ -497,10 +526,17 @@ func testRandomArrivalImport(t *testing.T) {
 	// Iteratively announce blocks, skipping one entry
 	imported := make(chan interface{}, len(hashes)-1)
 	tester.fetcher.importedHook = func(header *types.Header, block *types.Block) {
-		if block == nil {
-			t.Fatalf("Fetcher try to import empty block")
+		if light {
+			if header == nil {
+				t.Fatalf("Fetcher try to import empty header")
+			}
+			imported <- header
+		} else {
+			if block == nil {
+				t.Fatalf("Fetcher try to import empty block")
+			}
+			imported <- block
 		}
-		imported <- block
 	}
 	for i := len(hashes) - 1; i >= 0; i-- {
 		if i != skip {
@@ -522,7 +558,7 @@ func TestQueueGapFill(t *testing.T) {
 	hashes, blocks := makeChain(targetBlocks, 0, genesis)
 	skip := targetBlocks / 2
 
-	tester := newTester()
+	tester := newTester(false)
 	defer tester.fetcher.Stop()
 	headerFetcher := tester.makeHeaderFetcher("valid", blocks, -gatherSlack)
 	bodyFetcher := tester.makeBodyFetcher("valid", blocks, 0)
@@ -550,7 +586,7 @@ func TestImportDeduplication(t *testing.T) {
 	hashes, blocks := makeChain(2, 0, genesis)
 
 	// Create the tester and wrap the importer with a counter
-	tester := newTester()
+	tester := newTester(false)
 	defer tester.fetcher.Stop()
 	headerFetcher := tester.makeHeaderFetcher("valid", blocks, -gatherSlack)
 	bodyFetcher := tester.makeBodyFetcher("valid", blocks, 0)
@@ -593,7 +629,7 @@ func TestDistantPropagationDiscarding(t *testing.T) {
 	low, high := len(hashes)/2+maxUncleDist+1, len(hashes)/2-maxQueueDist-1
 
 	// Create a tester and simulate a head block being the middle of the above chain
-	tester := newTester()
+	tester := newTester(false)
 	defer tester.fetcher.Stop()
 
 	tester.lock.Lock()
@@ -618,9 +654,9 @@ func TestDistantPropagationDiscarding(t *testing.T) {
 // Tests that announcements with numbers much lower or higher than out current
 // head get discarded to prevent wasting resources on useless blocks from faulty
 // peers.
-func TestDistantAnnouncementDiscarding(t *testing.T) { testDistantAnnouncementDiscarding(t) }
+func TestDistantAnnouncementDiscarding(t *testing.T) { testDistantAnnouncementDiscarding(t, false) }
 
-func testDistantAnnouncementDiscarding(t *testing.T) {
+func testDistantAnnouncementDiscarding(t *testing.T, light bool) {
 	// Create a long chain to import and define the discard boundaries
 	hashes, blocks := makeChain(3*maxQueueDist, 0, genesis)
 	head := hashes[len(hashes)/2]
@@ -628,7 +664,7 @@ func testDistantAnnouncementDiscarding(t *testing.T) {
 	low, high := len(hashes)/2+maxUncleDist+1, len(hashes)/2-maxQueueDist-1
 
 	// Create a tester and simulate a head block being the middle of the above chain
-	tester := newTester()
+	tester := newTester(light)
 	defer tester.fetcher.Stop()
 
 	tester.lock.Lock()
@@ -661,23 +697,30 @@ func testDistantAnnouncementDiscarding(t *testing.T) {
 
 // Tests that peers announcing blocks with invalid numbers (i.e. not matching
 // the headers provided afterwards) get dropped as malicious.
-func TestInvalidNumberAnnouncement(t *testing.T) { testInvalidNumberAnnouncement(t) }
+func TestInvalidNumberAnnouncement(t *testing.T) { testInvalidNumberAnnouncement(t, false) }
 
-func testInvalidNumberAnnouncement(t *testing.T) {
+func testInvalidNumberAnnouncement(t *testing.T, light bool) {
 	// Create a single block to import and check numbers against
 	hashes, blocks := makeChain(1, 0, genesis)
 
-	tester := newTester()
+	tester := newTester(light)
 	defer tester.fetcher.Stop()
 	badHeaderFetcher := tester.makeHeaderFetcher("bad", blocks, -gatherSlack)
 	badBodyFetcher := tester.makeBodyFetcher("bad", blocks, 0)
 
 	imported := make(chan interface{})
 	tester.fetcher.importedHook = func(header *types.Header, block *types.Block) {
-		if block == nil {
-			t.Fatalf("Fetcher try to import empty block")
+		if light {
+			if header == nil {
+				t.Fatalf("Fetcher try to import empty header")
+			}
+			imported <- header
+		} else {
+			if block == nil {
+				t.Fatalf("Fetcher try to import empty block")
+			}
+			imported <- block
 		}
-		imported <- block
 	}
 	// Announce a block with a bad number, check for immediate drop
 	tester.fetcher.Notify("bad", hashes[0], 2, time.Now().Add(-arriveTimeout), badHeaderFetcher, badBodyFetcher)
@@ -713,7 +756,7 @@ func TestEmptyBlockShortCircuit(t *testing.T) {
 	// Create a chain of blocks to import
 	hashes, blocks := makeChain(32, 0, genesis)
 
-	tester := newTester()
+	tester := newTester(false)
 	defer tester.fetcher.Stop()
 	headerFetcher := tester.makeHeaderFetcher("valid", blocks, -gatherSlack)
 	bodyFetcher := tester.makeBodyFetcher("valid", blocks, 0)
@@ -753,7 +796,7 @@ func TestEmptyBlockShortCircuit(t *testing.T) {
 // the fetcher remains operational.
 func TestHashMemoryExhaustionAttack(t *testing.T) {
 	// Create a tester with instrumented import hooks
-	tester := newTester()
+	tester := newTester(false)
 	defer tester.fetcher.Stop()
 
 	imported, announces := make(chan interface{}), int32(0)
@@ -801,7 +844,7 @@ func TestHashMemoryExhaustionAttack(t *testing.T) {
 // system memory.
 func TestBlockMemoryExhaustionAttack(t *testing.T) {
 	// Create a tester with instrumented import hooks
-	tester := newTester()
+	tester := newTester(false)
 	defer tester.fetcher.Stop()
 
 	imported, enqueued := make(chan interface{}, 1), int32(0)

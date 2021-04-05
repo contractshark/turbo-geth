@@ -14,12 +14,9 @@ import (
 	"github.com/ledgerwatch/turbo-geth/core/types"
 	"github.com/ledgerwatch/turbo-geth/ethdb"
 	"github.com/ledgerwatch/turbo-geth/log"
-	"github.com/ledgerwatch/turbo-geth/metrics"
 	"github.com/ledgerwatch/turbo-geth/params"
 	"github.com/ledgerwatch/turbo-geth/rlp"
 )
-
-var stageHeadersGauge = metrics.NewRegisteredGauge("stage/headers", nil)
 
 func SpawnHeaderDownloadStage(s *StageState, u Unwinder, d DownloaderGlue, headersFetchers []func() error) error {
 	err := d.SpawnHeaderDownloadStage(headersFetchers, s, u)
@@ -32,7 +29,7 @@ func SpawnHeaderDownloadStage(s *StageState, u Unwinder, d DownloaderGlue, heade
 // Implements consensus.ChainReader
 type ChainReader struct {
 	config *params.ChainConfig
-	db     ethdb.Getter
+	db     ethdb.Database
 }
 
 // Config retrieves the blockchain's chain configuration.
@@ -73,7 +70,7 @@ func (cr ChainReader) GetBlock(hash common.Hash, number uint64) *types.Block {
 	return rawdb.ReadBlock(cr.db, hash, number)
 }
 
-func VerifyHeaders(db ethdb.Getter, headers []*types.Header, config *params.ChainConfig, engine consensus.Engine, checkFreq int) error {
+func VerifyHeaders(db ethdb.Database, headers []*types.Header, config *params.ChainConfig, engine consensus.Engine, checkFreq int) error {
 	// Generate the list of seal verification requests, and start the parallel verifier
 	seals := make([]bool, len(headers))
 	if checkFreq != 0 {
@@ -140,9 +137,9 @@ Error: %v
 	if rawdb.ReadHeader(db, headers[0].ParentHash, headers[0].Number.Uint64()-1) == nil {
 		return false, false, 0, fmt.Errorf("%s: unknown parent %x", logPrefix, headers[0].ParentHash)
 	}
-	parentTd, pErr := rawdb.ReadTd(db, headers[0].ParentHash, headers[0].Number.Uint64()-1)
-	if pErr != nil {
-		return false, false, 0, fmt.Errorf("[%s] %w", logPrefix, pErr)
+	parentTd, err := rawdb.ReadTd(db, headers[0].ParentHash, headers[0].Number.Uint64()-1)
+	if err != nil {
+		return false, false, 0, fmt.Errorf("[%s] %w", logPrefix, err)
 	}
 	externTd := new(big.Int).Set(parentTd)
 	for i, header := range headers {
@@ -155,9 +152,9 @@ Error: %v
 	}
 	headHash := rawdb.ReadHeadHeaderHash(db)
 	headNumber := rawdb.ReadHeaderNumber(db, headHash)
-	localTd, tdErr := rawdb.ReadTd(db, headHash, *headNumber)
-	if tdErr != nil {
-		return false, false, 0, tdErr
+	localTd, err := rawdb.ReadTd(db, headHash, *headNumber)
+	if err != nil {
+		return false, false, 0, err
 	}
 	lastHeader := headers[len(headers)-1]
 	// If the total difficulty is higher than our known, add it to the canonical chain
@@ -169,15 +166,14 @@ Error: %v
 		if lastHeader.Number.Uint64() < *headNumber {
 			newCanonical = true
 		} else if lastHeader.Number.Uint64() == *headNumber {
-			//nolint:gosec
 			newCanonical = mrand.Float64() < 0.5
 		}
 	}
 
 	var deepFork bool // Whether the forkBlock is outside this header chain segment
-	ch, chErr := rawdb.ReadCanonicalHash(db, headers[0].Number.Uint64()-1)
-	if chErr != nil {
-		return false, false, 0, fmt.Errorf("[%s] %w", logPrefix, chErr)
+	ch, err := rawdb.ReadCanonicalHash(db, headers[0].Number.Uint64()-1)
+	if err != nil {
+		return false, false, 0, fmt.Errorf("[%s] %w", logPrefix, err)
 	}
 	if newCanonical && headers[0].ParentHash != ch {
 		deepFork = true
@@ -198,9 +194,9 @@ Error: %v
 			continue
 		}
 		number := header.Number.Uint64()
-		ch, chErr := rawdb.ReadCanonicalHash(batch, number)
-		if chErr != nil {
-			return false, false, 0, fmt.Errorf("[%s] %w", logPrefix, chErr)
+		ch, err := rawdb.ReadCanonicalHash(batch, number)
+		if err != nil {
+			return false, false, 0, fmt.Errorf("[%s] %w", logPrefix, err)
 		}
 		hashesMatch := header.Hash() == ch
 		if newCanonical && !deepFork && !fork && !hashesMatch {
@@ -211,21 +207,20 @@ Error: %v
 			fork = true
 		}
 		if newCanonical {
-			if err := rawdb.WriteCanonicalHash(batch, header.Hash(), header.Number.Uint64()); err != nil {
+			if err = rawdb.WriteCanonicalHash(batch, header.Hash(), header.Number.Uint64()); err != nil {
 				return false, false, 0, fmt.Errorf("[%s] %w", logPrefix, err)
 			}
 		}
-		data, rlpErr := rlp.EncodeToBytes(header)
-		if rlpErr != nil {
-			return false, false, 0, fmt.Errorf("[%s] Failed to RLP encode header: %w", logPrefix, rlpErr)
+		data, err := rlp.EncodeToBytes(header)
+		if err != nil {
+			return false, false, 0, fmt.Errorf("[%s] Failed to RLP encode header: %w", logPrefix, err)
 		}
 		if err := rawdb.WriteTd(batch, header.Hash(), header.Number.Uint64(), td); err != nil {
 			return false, false, 0, fmt.Errorf("[%s] Failed to WriteTd: %w", logPrefix, err)
 		}
-		if err := batch.Put(dbutils.HeadersBucket, dbutils.HeaderKey(number, header.Hash()), data); err != nil {
+		if err := batch.Put(dbutils.HeaderPrefix, dbutils.HeaderKey(number, header.Hash()), data); err != nil {
 			return false, false, 0, fmt.Errorf("[%s] Failed to store header: %w", logPrefix, err)
 		}
-		stageHeadersGauge.Update(int64(lastHeader.Number.Uint64()))
 	}
 	if deepFork {
 		forkHeader := rawdb.ReadHeader(batch, headers[0].ParentHash, headers[0].Number.Uint64()-1)
@@ -247,7 +242,8 @@ Error: %v
 			forkBlockNumber = forkHeader.Number.Uint64() - 1
 			forkHash = forkHeader.ParentHash
 		}
-		if err := rawdb.WriteCanonicalHash(batch, headers[0].ParentHash, headers[0].Number.Uint64()-1); err != nil {
+		err = rawdb.WriteCanonicalHash(batch, headers[0].ParentHash, headers[0].Number.Uint64()-1)
+		if err != nil {
 			return false, false, 0, err
 		}
 	}
@@ -255,21 +251,21 @@ Error: %v
 	if reorg {
 		// Delete any canonical number assignments above the new head
 		for i := lastHeader.Number.Uint64() + 1; i <= *headNumber; i++ {
-			if err := rawdb.DeleteCanonicalHash(batch, i); err != nil {
+			err = rawdb.DeleteCanonicalHash(batch, i)
+			if err != nil {
 				return false, false, 0, fmt.Errorf("[%s] %w", logPrefix, err)
 			}
 		}
 	}
 	if newCanonical {
 		encoded := dbutils.EncodeBlockNumber(lastHeader.Number.Uint64())
-		if err := batch.Put(dbutils.HeaderNumberBucket, lastHeader.Hash().Bytes(), encoded); err != nil {
-			return false, false, 0, fmt.Errorf("[%s] failed to store hash to number mapping: %w", logPrefix, err)
+
+		if err := batch.Put(dbutils.HeaderNumberPrefix, lastHeader.Hash().Bytes(), encoded); err != nil {
+			return false, false, 0, fmt.Errorf("[%s] Failed to store hash to number mapping: %w", logPrefix, err)
 		}
-		if err := rawdb.WriteHeadHeaderHash(batch, lastHeader.Hash()); err != nil {
-			return false, false, 0, fmt.Errorf("[%s] failed to write head header hash: %w", logPrefix, err)
-		}
+		rawdb.WriteHeadHeaderHash(batch, lastHeader.Hash())
 	}
-	if err := batch.Commit(); err != nil {
+	if _, err := batch.Commit(); err != nil {
 		return false, false, 0, fmt.Errorf("%s: write header markers into disk: %w", logPrefix, err)
 	}
 	// Report some public statistics so the user has a clue what's going on

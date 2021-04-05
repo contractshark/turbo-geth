@@ -84,9 +84,7 @@ func TestInsertHeaderChainTotalDifficulty(t *testing.T) {
 		panic(err)
 	}
 	rawdb.WriteHeader(context.TODO(), db, origin)
-	if err := rawdb.WriteHeadHeaderHash(db, origin.Hash()); err != nil {
-		panic(err)
-	}
+	rawdb.WriteHeadHeaderHash(db, origin.Hash())
 	err := rawdb.WriteCanonicalHash(db, origin.Hash(), 0)
 	assert.NoError(t, err)
 

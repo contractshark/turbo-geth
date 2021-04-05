@@ -32,8 +32,6 @@ import (
 	"github.com/ledgerwatch/turbo-geth/params"
 )
 
-const opTestArg = "ABCDEF090807060504030201ffffffffffffffffffffffffffffffffffffffff"
-
 type TwoOperandTestcase struct {
 	X        string
 	Y        string
@@ -95,7 +93,8 @@ func init() {
 
 func testTwoOperandOp(t *testing.T, tests []TwoOperandTestcase, opFn executionFunc, name string) {
 	var (
-		env            = NewEVM(BlockContext{}, TxContext{}, nil, params.TestChainConfig, Config{})
+		env            = NewEVM(Context{}, nil, params.TestChainConfig, Config{})
+		rstack         = stack.NewReturnStack()
 		stack          = stack.New()
 		pc             = uint64(0)
 		evmInterpreter = env.interpreter.(*EVMInterpreter)
@@ -107,7 +106,7 @@ func testTwoOperandOp(t *testing.T, tests []TwoOperandTestcase, opFn executionFu
 		expected := new(uint256.Int).SetBytes(common.Hex2Bytes(test.Expected))
 		stack.Push(x)
 		stack.Push(y)
-		opFn(&pc, evmInterpreter, &callCtx{nil, stack, nil})
+		opFn(&pc, evmInterpreter, &callCtx{nil, stack, rstack, nil})
 		if len(stack.Data) != 1 {
 			t.Errorf("Expected one item on stack after %v, got %d: ", name, len(stack.Data))
 		}
@@ -194,7 +193,7 @@ func TestSAR(t *testing.T) {
 
 func TestAddMod(t *testing.T) {
 	var (
-		env            = NewEVM(BlockContext{}, TxContext{}, nil, params.TestChainConfig, Config{})
+		env            = NewEVM(Context{}, nil, params.TestChainConfig, Config{})
 		stack          = stack.New()
 		evmInterpreter = NewEVMInterpreter(env, env.vmConfig)
 		pc             = uint64(0)
@@ -222,7 +221,7 @@ func TestAddMod(t *testing.T) {
 		stack.Push(z)
 		stack.Push(y)
 		stack.Push(x)
-		opAddmod(&pc, evmInterpreter, &callCtx{nil, stack, nil})
+		opAddmod(&pc, evmInterpreter, &callCtx{nil, stack, nil, nil})
 		actual := stack.Pop()
 		if actual.Cmp(expected) != 0 {
 			t.Errorf("Testcase %d, expected  %x, got %x", i, expected, actual)
@@ -231,40 +230,43 @@ func TestAddMod(t *testing.T) {
 }
 
 // getResult is a convenience function to generate the expected values
-// func getResult(args []*twoOperandParams, opFn executionFunc) []TwoOperandTestcase {
-// 	var (
-// 		env         = NewEVM(BlockContext{}, TxContext{}, nil, params.TestChainConfig, Config{})
-// 		stack       = stack.New()
-// 		pc          = uint64(0)
-// 		interpreter = env.interpreter.(*EVMInterpreter)
-// 	)
-// 	result := make([]TwoOperandTestcase, len(args))
-// 	for i, param := range args {
-// 		x := new(uint256.Int).SetBytes(common.Hex2Bytes(param.x))
-// 		y := new(uint256.Int).SetBytes(common.Hex2Bytes(param.y))
-// 		stack.Push(x)
-// 		stack.Push(y)
-// 		opFn(&pc, interpreter, &callCtx{nil, stack, nil})
-// 		actual := stack.Pop()
-// 		result[i] = TwoOperandTestcase{param.x, param.y, fmt.Sprintf("%064x", actual)}
-// 	}
-// 	return result
-// }
+func getResult(args []*twoOperandParams, opFn executionFunc) []TwoOperandTestcase {
+	var (
+		env         = NewEVM(Context{}, nil, params.TestChainConfig, Config{})
+		rstack      = stack.NewReturnStack()
+		stack       = stack.New()
+		pc          = uint64(0)
+		interpreter = env.interpreter.(*EVMInterpreter)
+	)
+	result := make([]TwoOperandTestcase, len(args))
+	for i, param := range args {
+		x := new(uint256.Int).SetBytes(common.Hex2Bytes(param.x))
+		y := new(uint256.Int).SetBytes(common.Hex2Bytes(param.y))
+		stack.Push(x)
+		stack.Push(y)
+		opFn(&pc, interpreter, &callCtx{nil, stack, rstack, nil})
+		actual := stack.Pop()
+		result[i] = TwoOperandTestcase{param.x, param.y, fmt.Sprintf("%064x", actual)}
+	}
+	return result
+}
 
 // utility function to fill the json-file with testcases
 // Enable this test to generate the 'testcases_xx.json' files
-// func TestWriteExpectedValues(t *testing.T) {
-// 	for name, method := range twoOpMethods {
-// 		data, err := json.Marshal(getResult(commonParams, method))
-// 		if err != nil {
-// 			t.Fatal(err)
-// 		}
-// 		_ = ioutil.WriteFile(fmt.Sprintf("testdata/testcases_%v.json", name), data, 0644)
-// 		if err != nil {
-// 			t.Fatal(err)
-// 		}
-// 	}
-// }
+func TestWriteExpectedValues(t *testing.T) {
+	t.Skip("Enable this test to create json test cases.")
+
+	for name, method := range twoOpMethods {
+		data, err := json.Marshal(getResult(commonParams, method))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = ioutil.WriteFile(fmt.Sprintf("testdata/testcases_%v.json", name), data, 0644)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
 
 // TestJsonTestcases runs through all the testcases defined as json-files
 func TestJsonTestcases(t *testing.T) {
@@ -281,7 +283,8 @@ func TestJsonTestcases(t *testing.T) {
 
 func opBenchmark(bench *testing.B, op executionFunc, args ...string) {
 	var (
-		env            = NewEVM(BlockContext{}, TxContext{}, nil, params.TestChainConfig, Config{})
+		env            = NewEVM(Context{}, nil, params.TestChainConfig, Config{})
+		rstack         = stack.NewReturnStack()
 		stack          = stack.New()
 		evmInterpreter = NewEVMInterpreter(env, env.vmConfig)
 	)
@@ -300,7 +303,7 @@ func opBenchmark(bench *testing.B, op executionFunc, args ...string) {
 			a.SetBytes(arg)
 			stack.Push(a)
 		}
-		op(&pc, evmInterpreter, &callCtx{nil, stack, nil})
+		op(&pc, evmInterpreter, &callCtx{nil, stack, rstack, nil})
 		stack.Pop()
 	}
 }
@@ -348,8 +351,8 @@ func BenchmarkOpSub256(b *testing.B) {
 }
 
 func BenchmarkOpMul(b *testing.B) {
-	x := opTestArg
-	y := opTestArg
+	x := "ABCDEF090807060504030201ffffffffffffffffffffffffffffffffffffffff"
+	y := "ABCDEF090807060504030201ffffffffffffffffffffffffffffffffffffffff"
 
 	opBenchmark(b, opMul, x, y)
 }
@@ -380,64 +383,64 @@ func BenchmarkOpSdiv(b *testing.B) {
 }
 
 func BenchmarkOpMod(b *testing.B) {
-	x := opTestArg
-	y := opTestArg
+	x := "ABCDEF090807060504030201ffffffffffffffffffffffffffffffffffffffff"
+	y := "ABCDEF090807060504030201ffffffffffffffffffffffffffffffffffffffff"
 
 	opBenchmark(b, opMod, x, y)
 }
 
 func BenchmarkOpSmod(b *testing.B) {
-	x := opTestArg
-	y := opTestArg
+	x := "ABCDEF090807060504030201ffffffffffffffffffffffffffffffffffffffff"
+	y := "ABCDEF090807060504030201ffffffffffffffffffffffffffffffffffffffff"
 
 	opBenchmark(b, opSmod, x, y)
 }
 
 func BenchmarkOpExp(b *testing.B) {
-	x := opTestArg
-	y := opTestArg
+	x := "ABCDEF090807060504030201ffffffffffffffffffffffffffffffffffffffff"
+	y := "ABCDEF090807060504030201ffffffffffffffffffffffffffffffffffffffff"
 
 	opBenchmark(b, opExp, x, y)
 }
 
 func BenchmarkOpSignExtend(b *testing.B) {
-	x := opTestArg
-	y := opTestArg
+	x := "ABCDEF090807060504030201ffffffffffffffffffffffffffffffffffffffff"
+	y := "ABCDEF090807060504030201ffffffffffffffffffffffffffffffffffffffff"
 
 	opBenchmark(b, opSignExtend, x, y)
 }
 
 func BenchmarkOpLt(b *testing.B) {
-	x := opTestArg
-	y := opTestArg
+	x := "ABCDEF090807060504030201ffffffffffffffffffffffffffffffffffffffff"
+	y := "ABCDEF090807060504030201ffffffffffffffffffffffffffffffffffffffff"
 
 	opBenchmark(b, opLt, x, y)
 }
 
 func BenchmarkOpGt(b *testing.B) {
-	x := opTestArg
-	y := opTestArg
+	x := "ABCDEF090807060504030201ffffffffffffffffffffffffffffffffffffffff"
+	y := "ABCDEF090807060504030201ffffffffffffffffffffffffffffffffffffffff"
 
 	opBenchmark(b, opGt, x, y)
 }
 
 func BenchmarkOpSlt(b *testing.B) {
-	x := opTestArg
-	y := opTestArg
+	x := "ABCDEF090807060504030201ffffffffffffffffffffffffffffffffffffffff"
+	y := "ABCDEF090807060504030201ffffffffffffffffffffffffffffffffffffffff"
 
 	opBenchmark(b, opSlt, x, y)
 }
 
 func BenchmarkOpSgt(b *testing.B) {
-	x := opTestArg
-	y := opTestArg
+	x := "ABCDEF090807060504030201ffffffffffffffffffffffffffffffffffffffff"
+	y := "ABCDEF090807060504030201ffffffffffffffffffffffffffffffffffffffff"
 
 	opBenchmark(b, opSgt, x, y)
 }
 
 func BenchmarkOpEq(b *testing.B) {
-	x := opTestArg
-	y := opTestArg
+	x := "ABCDEF090807060504030201ffffffffffffffffffffffffffffffffffffffff"
+	y := "ABCDEF090807060504030201ffffffffffffffffffffffffffffffffffffffff"
 
 	opBenchmark(b, opEq, x, y)
 }
@@ -447,45 +450,45 @@ func BenchmarkOpEq2(b *testing.B) {
 	opBenchmark(b, opEq, x, y)
 }
 func BenchmarkOpAnd(b *testing.B) {
-	x := opTestArg
-	y := opTestArg
+	x := "ABCDEF090807060504030201ffffffffffffffffffffffffffffffffffffffff"
+	y := "ABCDEF090807060504030201ffffffffffffffffffffffffffffffffffffffff"
 
 	opBenchmark(b, opAnd, x, y)
 }
 
 func BenchmarkOpOr(b *testing.B) {
-	x := opTestArg
-	y := opTestArg
+	x := "ABCDEF090807060504030201ffffffffffffffffffffffffffffffffffffffff"
+	y := "ABCDEF090807060504030201ffffffffffffffffffffffffffffffffffffffff"
 
 	opBenchmark(b, opOr, x, y)
 }
 
 func BenchmarkOpXor(b *testing.B) {
-	x := opTestArg
-	y := opTestArg
+	x := "ABCDEF090807060504030201ffffffffffffffffffffffffffffffffffffffff"
+	y := "ABCDEF090807060504030201ffffffffffffffffffffffffffffffffffffffff"
 
 	opBenchmark(b, opXor, x, y)
 }
 
 func BenchmarkOpByte(b *testing.B) {
-	x := opTestArg
-	y := opTestArg
+	x := "ABCDEF090807060504030201ffffffffffffffffffffffffffffffffffffffff"
+	y := "ABCDEF090807060504030201ffffffffffffffffffffffffffffffffffffffff"
 
 	opBenchmark(b, opByte, x, y)
 }
 
 func BenchmarkOpAddmod(b *testing.B) {
-	x := opTestArg
-	y := opTestArg
-	z := opTestArg
+	x := "ABCDEF090807060504030201ffffffffffffffffffffffffffffffffffffffff"
+	y := "ABCDEF090807060504030201ffffffffffffffffffffffffffffffffffffffff"
+	z := "ABCDEF090807060504030201ffffffffffffffffffffffffffffffffffffffff"
 
 	opBenchmark(b, opAddmod, x, y, z)
 }
 
 func BenchmarkOpMulmod(b *testing.B) {
-	x := opTestArg
-	y := opTestArg
-	z := opTestArg
+	x := "ABCDEF090807060504030201ffffffffffffffffffffffffffffffffffffffff"
+	y := "ABCDEF090807060504030201ffffffffffffffffffffffffffffffffffffffff"
+	z := "ABCDEF090807060504030201ffffffffffffffffffffffffffffffffffffffff"
 
 	opBenchmark(b, opMulmod, x, y, z)
 }
@@ -515,7 +518,8 @@ func BenchmarkOpIsZero(b *testing.B) {
 
 func TestOpMstore(t *testing.T) {
 	var (
-		env            = NewEVM(BlockContext{}, TxContext{}, nil, params.TestChainConfig, Config{})
+		env            = NewEVM(Context{}, nil, params.TestChainConfig, Config{})
+		rstack         = stack.NewReturnStack()
 		stack          = stack.New()
 		mem            = NewMemory()
 		evmInterpreter = NewEVMInterpreter(env, env.vmConfig)
@@ -526,12 +530,12 @@ func TestOpMstore(t *testing.T) {
 	pc := uint64(0)
 	v := "abcdef00000000000000abba000000000deaf000000c0de00100000000133700"
 	stack.PushN(*new(uint256.Int).SetBytes(common.Hex2Bytes(v)), *new(uint256.Int))
-	opMstore(&pc, evmInterpreter, &callCtx{mem, stack, nil})
+	opMstore(&pc, evmInterpreter, &callCtx{mem, stack, rstack, nil})
 	if got := common.Bytes2Hex(mem.GetCopy(0, 32)); got != v {
 		t.Fatalf("Mstore fail, got %v, expected %v", got, v)
 	}
 	stack.PushN(*new(uint256.Int).SetOne(), *new(uint256.Int))
-	opMstore(&pc, evmInterpreter, &callCtx{mem, stack, nil})
+	opMstore(&pc, evmInterpreter, &callCtx{mem, stack, rstack, nil})
 	if common.Bytes2Hex(mem.GetCopy(0, 32)) != "0000000000000000000000000000000000000000000000000000000000000001" {
 		t.Fatalf("Mstore failed to overwrite previous value")
 	}
@@ -539,7 +543,8 @@ func TestOpMstore(t *testing.T) {
 
 func BenchmarkOpMstore(bench *testing.B) {
 	var (
-		env            = NewEVM(BlockContext{}, TxContext{}, nil, params.TestChainConfig, Config{})
+		env            = NewEVM(Context{}, nil, params.TestChainConfig, Config{})
+		rstack         = stack.NewReturnStack()
 		stack          = stack.New()
 		mem            = NewMemory()
 		evmInterpreter = NewEVMInterpreter(env, env.vmConfig)
@@ -554,13 +559,14 @@ func BenchmarkOpMstore(bench *testing.B) {
 	bench.ResetTimer()
 	for i := 0; i < bench.N; i++ {
 		stack.PushN(*value, *memStart)
-		opMstore(&pc, evmInterpreter, &callCtx{mem, stack, nil})
+		opMstore(&pc, evmInterpreter, &callCtx{mem, stack, rstack, nil})
 	}
 }
 
 func BenchmarkOpSHA3(bench *testing.B) {
 	var (
-		env            = NewEVM(BlockContext{}, TxContext{}, nil, params.TestChainConfig, Config{})
+		env            = NewEVM(Context{}, nil, params.TestChainConfig, Config{})
+		rstack         = stack.NewReturnStack()
 		stack          = stack.New()
 		mem            = NewMemory()
 		evmInterpreter = NewEVMInterpreter(env, env.vmConfig)
@@ -573,7 +579,7 @@ func BenchmarkOpSHA3(bench *testing.B) {
 	bench.ResetTimer()
 	for i := 0; i < bench.N; i++ {
 		stack.PushN(*uint256.NewInt().SetUint64(32), *start)
-		opSha3(&pc, evmInterpreter, &callCtx{mem, stack, nil})
+		opSha3(&pc, evmInterpreter, &callCtx{mem, stack, rstack, nil})
 	}
 }
 

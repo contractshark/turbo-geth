@@ -19,6 +19,7 @@ package core
 import (
 	"sync/atomic"
 
+	"github.com/ledgerwatch/turbo-geth/common"
 	"github.com/ledgerwatch/turbo-geth/consensus"
 	"github.com/ledgerwatch/turbo-geth/core/state"
 	"github.com/ledgerwatch/turbo-geth/core/types"
@@ -47,26 +48,19 @@ func newStatePrefetcher(config *params.ChainConfig, bc *BlockChain, engine conse
 // Prefetch processes the state changes according to the Ethereum rules by running
 // the transaction messages using the statedb, but any changes are discarded. The
 // only goal is to pre-cache transaction signatures and state trie nodes.
-func (p *statePrefetcher) Prefetch(block *types.Block, ibs *state.IntraBlockState, cfg vm.Config, interrupt *uint32) {
+func (p *statePrefetcher) Prefetch(block *types.Block, statedb *state.IntraBlockState, cfg vm.Config, interrupt *uint32) {
 	var (
-		header       = block.Header()
-		gaspool      = new(GasPool).AddGas(block.GasLimit())
-		blockContext = NewEVMBlockContext(header, p.bc, nil)
-		evm          = vm.NewEVM(blockContext, vm.TxContext{}, ibs, p.config, cfg)
-		signer       = types.MakeSigner(p.config, header.Number)
+		header  = block.Header()
+		gaspool = new(GasPool).AddGas(block.GasLimit())
 	)
 	for i, tx := range block.Transactions() {
 		// If block precaching was interrupted, abort
 		if interrupt != nil && atomic.LoadUint32(interrupt) == 1 {
 			return
 		}
-		// Convert the transaction into an executable message and pre-cache its sender
-		msg, err := tx.AsMessage(signer)
-		if err != nil {
-			return // Also invalid block, bail out
-		}
-		ibs.Prepare(tx.Hash(), block.Hash(), i)
-		if err := precacheTransaction(msg, p.config, gaspool, ibs, header, evm); err != nil {
+		// Block precaching permitted to continue, execute the transaction
+		statedb.Prepare(tx.Hash(), block.Hash(), i)
+		if err := precacheTransaction(p.config, p.bc, nil, gaspool, statedb, header, tx, cfg); err != nil {
 			return // Ugh, something went horribly wrong, bail out
 		}
 	}
@@ -75,10 +69,17 @@ func (p *statePrefetcher) Prefetch(block *types.Block, ibs *state.IntraBlockStat
 // precacheTransaction attempts to apply a transaction to the given state database
 // and uses the input parameters for its environment. The goal is not to execute
 // the transaction successfully, rather to warm up touched data slots.
-func precacheTransaction(msg types.Message, config *params.ChainConfig, gaspool *GasPool, ibs vm.IntraBlockState, header *types.Header, evm *vm.EVM) error { //nolint:unparam
-	// Update the evm with the new transaction context.
-	evm.Reset(NewEVMTxContext(msg), ibs)
-	// Add addresses to access list if applicable
-	_, err := ApplyMessage(evm, msg, gaspool, true, false)
+func precacheTransaction(config *params.ChainConfig, bc ChainContext, author *common.Address, gaspool *GasPool, statedb vm.IntraBlockState, header *types.Header, tx *types.Transaction, cfg vm.Config) error {
+	// Convert the transaction into an executable message and pre-cache its sender
+	msg, err := tx.AsMessage(types.MakeSigner(config, header.Number))
+	if err != nil {
+		return err
+	}
+	// Create the EVM and execute the transaction
+	context := NewEVMContext(msg, header, bc, author)
+	cfg.SkipAnalysis = SkipAnalysis(config, header.Number.Uint64())
+	vm := vm.NewEVM(context, statedb, config, cfg)
+
+	_, err = ApplyMessage(vm, msg, gaspool, true /* refunds */, false /* gasBailout */)
 	return err
 }

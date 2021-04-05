@@ -6,12 +6,11 @@ package types
 
 import (
 	"errors"
+	pkg1_common "github.com/ledgerwatch/turbo-geth/common"
+	codec1978 "github.com/ugorji/go/codec"
 	pkg2_big "math/big"
 	"runtime"
 	"strconv"
-
-	pkg1_common "github.com/ledgerwatch/turbo-geth/common"
-	codec1978 "github.com/ugorji/go/codec"
 )
 
 const (

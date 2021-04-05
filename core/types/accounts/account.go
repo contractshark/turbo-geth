@@ -24,13 +24,6 @@ type Account struct {
 	Incarnation uint64
 }
 
-const (
-	MimetypeDataWithValidator = "data/validator"
-	MimetypeTypedData         = "data/typed"
-	MimetypeClique            = "application/x-clique-header"
-	MimetypeTextPlain         = "text/plain"
-)
-
 var emptyCodeHash = crypto.Keccak256Hash(nil)
 var emptyRoot = common.HexToHash("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421")
 
@@ -427,21 +420,19 @@ func (a *Account) DecodeForHashing(enc []byte) error {
 			)
 		}
 
-		// Commented out because of the ineffectual assignment - uncomment if adding more fields
 		var storageSize uint64
 		if storageSizeBytes == 0 && newPos == pos {
 			storageSize = uint64(enc[newPos])
-			pos = newPos + 1
+			// Commented out because of the ineffectual assignment - uncomment if adding more fields
+			//pos = newPos + 1
 		} else {
 			for _, b := range enc[newPos : newPos+storageSizeBytes] {
 				storageSize = (storageSize << 8) + uint64(b)
 			}
-			pos = newPos + storageSizeBytes
+			// Commented out because of the ineffectual assignment - uncomment if adding more fields
+			//pos = newPos + storageSizeBytes
 		}
-		_ = storageSize
 	}
-	_ = pos
-
 	return nil
 }
 
@@ -520,8 +511,6 @@ func (a *Account) DecodeForStorage(enc []byte) error {
 		a.CodeHash.SetBytes(enc[pos+1 : pos+decodeLength+1])
 		pos += decodeLength + 1
 	}
-
-	_ = pos
 
 	return nil
 }

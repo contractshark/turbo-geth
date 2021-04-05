@@ -23,13 +23,10 @@ import (
 	"github.com/ledgerwatch/turbo-geth/eth/stagedsync/stages"
 	"github.com/ledgerwatch/turbo-geth/ethdb"
 	"github.com/ledgerwatch/turbo-geth/log"
-	"github.com/ledgerwatch/turbo-geth/metrics"
 	"github.com/ledgerwatch/turbo-geth/params"
 	"github.com/ledgerwatch/turbo-geth/turbo/shards"
 	"github.com/ledgerwatch/turbo-geth/turbo/silkworm"
 )
-
-var stageExecutionGauge = metrics.NewRegisteredGauge("stage/execution", nil)
 
 const (
 	logInterval = 30 * time.Second
@@ -56,23 +53,20 @@ type ExecuteBlockStageParams struct {
 	SilkwormExecutionFunc unsafe.Pointer
 }
 
-func readBlock(blockNum uint64, tx ethdb.Getter) (*types.Block, error) {
+func readBlock(blockNum uint64, tx ethdb.Database) (*types.Block, error) {
 	blockHash, err := rawdb.ReadCanonicalHash(tx, blockNum)
 	if err != nil {
 		return nil, err
 	}
 	block := rawdb.ReadBlock(tx, blockHash, blockNum)
 
-	senders, errSenders := rawdb.ReadSenders(tx, blockHash, blockNum)
-	if errSenders != nil {
-		return nil, errSenders
-	}
+	senders := rawdb.ReadSenders(tx, blockHash, blockNum)
 	block.Body().SendersToTxs(senders)
 
 	return block, nil
 }
 
-func executeBlockWithGo(block *types.Block, tx ethdb.Database, cache *shards.StateCache, batch ethdb.Database, chainConfig *params.ChainConfig,
+func executeBlockWithGo(block *types.Block, tx ethdb.DbWithPendingMutations, cache *shards.StateCache, batch ethdb.Database, chainConfig *params.ChainConfig,
 	chainContext core.ChainContext, vmConfig *vm.Config, params ExecuteBlockStageParams) error {
 
 	blockNum := block.NumberU64()
@@ -120,6 +114,7 @@ func executeBlockWithGo(block *types.Block, tx ethdb.Database, cache *shards.Sta
 }
 
 func SpawnExecuteBlocksStage(s *StageState, stateDB ethdb.Database, chainConfig *params.ChainConfig, chainContext *core.TinyChainContext, vmConfig *vm.Config, quit <-chan struct{}, params ExecuteBlockStageParams) error {
+	params.Cache = nil
 	prevStageProgress, errStart := stages.GetStageProgress(stateDB, stages.Senders)
 	if errStart != nil {
 		return errStart
@@ -219,6 +214,9 @@ func SpawnExecuteBlocksStage(s *StageState, stateDB ethdb.Database, chainConfig 
 					if err = tx.CommitAndBegin(context.Background()); err != nil {
 						return err
 					}
+					if err = printBucketsSize(tx); err != nil {
+						return err
+					}
 					chainContext.SetDB(tx)
 				}
 			}
@@ -239,6 +237,9 @@ func SpawnExecuteBlocksStage(s *StageState, stateDB ethdb.Database, chainConfig 
 					if err = tx.CommitAndBegin(context.Background()); err != nil {
 						return err
 					}
+					if err = printBucketsSize(tx); err != nil {
+						return err
+					}
 					chainContext.SetDB(tx)
 				}
 				//start = time.Now()
@@ -252,7 +253,6 @@ func SpawnExecuteBlocksStage(s *StageState, stateDB ethdb.Database, chainConfig 
 		case <-logEvery.C:
 			logBlock, logTime = logProgress(logPrefix, logBlock, logTime, blockNum, batch, cache)
 		}
-		stageExecutionGauge.Update(int64(blockNum))
 	}
 
 	if cache == nil {
@@ -260,12 +260,12 @@ func SpawnExecuteBlocksStage(s *StageState, stateDB ethdb.Database, chainConfig 
 			if err := s.Update(batch, stageProgress); err != nil {
 				return err
 			}
-			if err := batch.Commit(); err != nil {
+			if _, err := batch.Commit(); err != nil {
 				return fmt.Errorf("%s: failed to write batch commit: %v", logPrefix, err)
 			}
 		}
 		if !useExternalTx {
-			if err := tx.Commit(); err != nil {
+			if _, err := tx.Commit(); err != nil {
 				return err
 			}
 		}
@@ -278,7 +278,7 @@ func SpawnExecuteBlocksStage(s *StageState, stateDB ethdb.Database, chainConfig 
 			return err
 		}
 		if !useExternalTx {
-			if err := tx.Commit(); err != nil {
+			if _, err := tx.Commit(); err != nil {
 				return err
 			}
 		}
@@ -363,7 +363,8 @@ func logProgress(logPrefix string, prevBlock uint64, prevTime time.Time, current
 	return currentBlock, currentTime
 }
 
-func UnwindExecutionStage(u *UnwindState, s *StageState, stateDB ethdb.Database, quit <-chan struct{}, params ExecuteBlockStageParams) error {
+func UnwindExecutionStage(u *UnwindState, s *StageState, stateDB ethdb.Database, params ExecuteBlockStageParams) error {
+	params.Cache = nil
 	if u.UnwindPoint >= s.BlockNumber {
 		s.Done()
 		return nil
@@ -381,30 +382,14 @@ func UnwindExecutionStage(u *UnwindState, s *StageState, stateDB ethdb.Database,
 		}
 		defer tx.Rollback()
 	}
+
 	logPrefix := s.state.LogPrefix()
 	log.Info(fmt.Sprintf("[%s] Unwind Execution", logPrefix), "from", s.BlockNumber, "to", u.UnwindPoint)
 
-	if err := unwindExecutionStage(u, s, tx.(ethdb.HasTx).Tx().(ethdb.RwTx), quit, params); err != nil {
-		return err
-	}
-	if err := u.Done(tx); err != nil {
-		return fmt.Errorf("%s: reset: %v", logPrefix, err)
-	}
-
-	if !useExternalTx {
-		if err := tx.Commit(); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func unwindExecutionStage(u *UnwindState, s *StageState, tx ethdb.RwTx, quit <-chan struct{}, params ExecuteBlockStageParams) error {
-	logPrefix := s.state.LogPrefix()
 	stateBucket := dbutils.PlainStateBucket
 	storageKeyLength := common.AddressLength + common.IncarnationLength + common.HashLength
 
-	accountMap, storageMap, errRewind := changeset.RewindData(tx, s.BlockNumber, u.UnwindPoint, quit)
+	accountMap, storageMap, errRewind := changeset.RewindData(tx, s.BlockNumber, u.UnwindPoint)
 	if errRewind != nil {
 		return fmt.Errorf("%s: getting rewind data: %v", logPrefix, errRewind)
 	}
@@ -452,7 +437,7 @@ func unwindExecutionStage(u *UnwindState, s *StageState, tx ethdb.RwTx, quit <-c
 		}
 	}
 
-	if err := changeset.Truncate(tx, u.UnwindPoint+1); err != nil {
+	if err := changeset.Truncate(tx.(ethdb.HasTx).Tx(), u.UnwindPoint+1); err != nil {
 		return fmt.Errorf("[%s] %w", logPrefix, err)
 	}
 
@@ -462,10 +447,19 @@ func unwindExecutionStage(u *UnwindState, s *StageState, tx ethdb.RwTx, quit <-c
 		}
 	}
 
+	if err := u.Done(tx); err != nil {
+		return fmt.Errorf("%s: reset: %v", logPrefix, err)
+	}
+
+	if !useExternalTx {
+		if _, err := tx.Commit(); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
-func writeAccountPlain(logPrefix string, db ethdb.RwTx, key string, acc accounts.Account) error {
+func writeAccountPlain(logPrefix string, db ethdb.Database, key string, acc accounts.Account) error {
 	var address common.Address
 	copy(address[:], key)
 	if err := cleanupContractCodeBucket(
@@ -473,8 +467,8 @@ func writeAccountPlain(logPrefix string, db ethdb.RwTx, key string, acc accounts
 		db,
 		dbutils.PlainContractCodeBucket,
 		acc,
-		func(db ethdb.Tx, out *accounts.Account) (bool, error) {
-			return rawdb.PlainReadAccount(ethdb.NewRoTxDb(db), address, out)
+		func(db ethdb.Getter, out *accounts.Account) (bool, error) {
+			return rawdb.PlainReadAccount(db, address, out)
 		},
 		func(inc uint64) []byte { return dbutils.PlainGenerateStoragePrefix(address[:], inc) },
 	); err != nil {
@@ -484,12 +478,22 @@ func writeAccountPlain(logPrefix string, db ethdb.RwTx, key string, acc accounts
 	return rawdb.PlainWriteAccount(db, address, acc)
 }
 
+func recoverCodeHashHashed(acc *accounts.Account, db ethdb.Getter, key string) {
+	var addrHash common.Hash
+	copy(addrHash[:], []byte(key))
+	if acc.Incarnation > 0 && acc.IsEmptyCodeHash() {
+		if codeHash, err2 := db.Get(dbutils.ContractCodeBucket, dbutils.GenerateStoragePrefix(addrHash[:], acc.Incarnation)); err2 == nil {
+			copy(acc.CodeHash[:], codeHash)
+		}
+	}
+}
+
 func cleanupContractCodeBucket(
 	logPrefix string,
-	db ethdb.RwTx,
+	db ethdb.Database,
 	bucket string,
 	acc accounts.Account,
-	readAccountFunc func(ethdb.Tx, *accounts.Account) (bool, error),
+	readAccountFunc func(ethdb.Getter, *accounts.Account) (bool, error),
 	getKeyForIncarnationFunc func(uint64) []byte,
 ) error {
 	var original accounts.Account
@@ -509,20 +513,37 @@ func cleanupContractCodeBucket(
 	return nil
 }
 
-func recoverCodeHashPlain(acc *accounts.Account, db ethdb.Tx, key string) {
+func recoverCodeHashPlain(acc *accounts.Account, db ethdb.Getter, key string) {
 	var address common.Address
 	copy(address[:], key)
 	if acc.Incarnation > 0 && acc.IsEmptyCodeHash() {
-		if codeHash, err2 := db.GetOne(dbutils.PlainContractCodeBucket, dbutils.PlainGenerateStoragePrefix(address[:], acc.Incarnation)); err2 == nil {
+		if codeHash, err2 := db.Get(dbutils.PlainContractCodeBucket, dbutils.PlainGenerateStoragePrefix(address[:], acc.Incarnation)); err2 == nil {
 			copy(acc.CodeHash[:], codeHash)
 		}
 	}
+}
+
+func deleteAccountHashed(db rawdb.DatabaseDeleter, key string) error {
+	var addrHash common.Hash
+	copy(addrHash[:], []byte(key))
+	return rawdb.DeleteAccount(db, addrHash)
 }
 
 func deleteAccountPlain(db ethdb.Deleter, key string) error {
 	var address common.Address
 	copy(address[:], key)
 	return rawdb.PlainDeleteAccount(db, address)
+}
+
+func deleteChangeSets(batch ethdb.Deleter, timestamp uint64, accountBucket, storageBucket string) error {
+	changeSetKey := dbutils.EncodeBlockNumber(timestamp)
+	if err := batch.Delete(accountBucket, changeSetKey, nil); err != nil {
+		return err
+	}
+	if err := batch.Delete(storageBucket, changeSetKey, nil); err != nil {
+		return err
+	}
+	return nil
 }
 
 func min(a, b uint64) uint64 {

@@ -30,18 +30,7 @@ func Trie(tx ethdb.Tx, slowChecks bool, quit <-chan struct{}) {
 	buf2 := make([]byte, 256)
 
 	{
-		c, err := tx.Cursor(dbutils.TrieOfAccountsBucket)
-		if err != nil {
-			panic(err)
-		}
-		trieAcc2, err := tx.Cursor(dbutils.TrieOfAccountsBucket)
-		if err != nil {
-			panic(err)
-		}
-		accC, err := tx.Cursor(dbutils.HashedAccountsBucket)
-		if err != nil {
-			panic(err)
-		}
+		c, trieAcc2, accC := tx.Cursor(dbutils.TrieOfAccountsBucket), tx.Cursor(dbutils.TrieOfAccountsBucket), tx.Cursor(dbutils.HashedAccountsBucket)
 		defer c.Close()
 		defer trieAcc2.Close()
 		defer accC.Close()
@@ -49,16 +38,8 @@ func Trie(tx ethdb.Tx, slowChecks bool, quit <-chan struct{}) {
 			if errc != nil {
 				panic(errc)
 			}
-			select {
-			default:
-			case <-quit:
-				return
-			case <-logEvery.C:
-				log.Info("trie account integrity", "key", fmt.Sprintf("%x", k))
-			}
-
-			hasState, hasTree, hasHash, hashes, _ := trie.UnmarshalTrieNode(v)
-			AssertSubset(k, hasTree, hasState)
+			hasState, hasBranch, hasHash, hashes, _ := trie.UnmarshalTrieNode(v)
+			AssertSubset(k, hasBranch, hasState)
 			AssertSubset(k, hasHash, hasState)
 			if bits.OnesCount16(hasHash) != len(hashes)/common.HashLength {
 				panic(fmt.Errorf("invariant bits.OnesCount16(hasHash) == len(hashes) failed: %d, %d", bits.OnesCount16(hasHash), len(v[6:])/common.HashLength))
@@ -66,7 +47,7 @@ func Trie(tx ethdb.Tx, slowChecks bool, quit <-chan struct{}) {
 			found := false
 			var parentK []byte
 
-			// must have parent with right hasTree bit
+			// must have parent with right hasBranch bit
 			for i := len(k) - 1; i > 0 && !found; i-- {
 				parentK = k[:i]
 				kParent, vParent, err := trieAcc2.SeekExact(parentK)
@@ -77,10 +58,10 @@ func Trie(tx ethdb.Tx, slowChecks bool, quit <-chan struct{}) {
 					continue
 				}
 				found = true
-				parenthasTree := binary.BigEndian.Uint16(vParent[2:])
-				parentHasBit := 1<<uint16(k[len(parentK)])&parenthasTree != 0
+				parentHasBranch := binary.BigEndian.Uint16(vParent[2:])
+				parentHasBit := 1<<uint16(k[len(parentK)])&parentHasBranch != 0
 				if !parentHasBit {
-					panic(fmt.Errorf("for %x found parent %x, but it has no branchBit: %016b", k, parentK, parenthasTree))
+					panic(fmt.Errorf("for %x found parent %x, but it has no branchBit: %016b", k, parentK, parentHasBranch))
 				}
 			}
 			if !found && len(k) > 1 {
@@ -91,7 +72,7 @@ func Trie(tx ethdb.Tx, slowChecks bool, quit <-chan struct{}) {
 			seek = seek[:len(k)+1]
 			copy(seek, k)
 			for i := uint16(0); i < 16; i++ {
-				if 1<<i&hasTree == 0 {
+				if 1<<i&hasBranch == 0 {
 					continue
 				}
 				seek[len(seek)-1] = uint8(i)
@@ -100,10 +81,10 @@ func Trie(tx ethdb.Tx, slowChecks bool, quit <-chan struct{}) {
 					panic(err)
 				}
 				if k2 == nil {
-					panic(fmt.Errorf("key %x has branches %016b, but there is no child %d in db; last seen key: %x->nil", k, hasTree, i, seek))
+					panic(fmt.Errorf("key %x has branches %016b, but there is no child %d in db; last seen key: %x->nil", k, hasBranch, i, seek))
 				}
 				if !bytes.HasPrefix(k2, seek) {
-					panic(fmt.Errorf("key %x has branches %016b, but there is no child %d in db; last seen key: %x->%x", k, hasTree, i, seek, k2))
+					panic(fmt.Errorf("key %x has branches %016b, but there is no child %d in db; last seen key: %x->%x", k, hasBranch, i, seek, k2))
 				}
 			}
 
@@ -136,21 +117,18 @@ func Trie(tx ethdb.Tx, slowChecks bool, quit <-chan struct{}) {
 					panic(fmt.Errorf("key %x has state %016b, but there is no child %d,%x in state", k, hasState, i, seek))
 				}
 			}
+
+			select {
+			default:
+			case <-quit:
+				return
+			case <-logEvery.C:
+				log.Info("trie account integrity", "key", fmt.Sprintf("%x", k))
+			}
 		}
 	}
 	{
-		c, err := tx.Cursor(dbutils.TrieOfStorageBucket)
-		if err != nil {
-			panic(err)
-		}
-		trieStorage, err := tx.Cursor(dbutils.TrieOfStorageBucket)
-		if err != nil {
-			panic(err)
-		}
-		storageC, err := tx.Cursor(dbutils.HashedStorageBucket)
-		if err != nil {
-			panic(err)
-		}
+		c, trieStorage, storageC := tx.Cursor(dbutils.TrieOfStorageBucket), tx.Cursor(dbutils.TrieOfStorageBucket), tx.Cursor(dbutils.HashedStorageBucket)
 		defer c.Close()
 		defer trieStorage.Close()
 		defer storageC.Close()
@@ -159,16 +137,9 @@ func Trie(tx ethdb.Tx, slowChecks bool, quit <-chan struct{}) {
 			if errc != nil {
 				panic(errc)
 			}
-			select {
-			default:
-			case <-quit:
-				return
-			case <-logEvery.C:
-				log.Info("trie storage integrity", "key", fmt.Sprintf("%x", k))
-			}
 
-			hasState, hasTree, hasHash, hashes, _ := trie.UnmarshalTrieNode(v)
-			AssertSubset(k, hasTree, hasState)
+			hasState, hasBranch, hasHash, hashes, _ := trie.UnmarshalTrieNode(v)
+			AssertSubset(k, hasBranch, hasState)
 			AssertSubset(k, hasHash, hasState)
 			if bits.OnesCount16(hasHash) != len(hashes)/common.HashLength {
 				panic(fmt.Errorf("invariant bits.OnesCount16(hasHash) == len(hashes) failed: %d, %d", bits.OnesCount16(hasHash), len(hashes)/common.HashLength))
@@ -177,7 +148,7 @@ func Trie(tx ethdb.Tx, slowChecks bool, quit <-chan struct{}) {
 			found := false
 			var parentK []byte
 
-			// must have parent with right hasTree bit
+			// must have parent with right hasBranch bit
 			for i := len(k) - 1; i >= 40 && !found; i-- {
 				parentK = k[:i]
 				kParent, vParent, err := trieStorage.SeekExact(parentK)
@@ -203,7 +174,7 @@ func Trie(tx ethdb.Tx, slowChecks bool, quit <-chan struct{}) {
 			seek = seek[:len(k)+1]
 			copy(seek, k)
 			for i := uint16(0); i < 16; i++ {
-				if 1<<i&hasTree == 0 {
+				if 1<<i&hasBranch == 0 {
 					continue
 				}
 				seek[len(seek)-1] = uint8(i)
@@ -212,7 +183,7 @@ func Trie(tx ethdb.Tx, slowChecks bool, quit <-chan struct{}) {
 					panic(err)
 				}
 				if !bytes.HasPrefix(k2, seek) {
-					panic(fmt.Errorf("key %x has branches %016b, but there is no child %d in db", k, hasTree, i))
+					panic(fmt.Errorf("key %x has branches %016b, but there is no child %d in db", k, hasBranch, i))
 				}
 			}
 
@@ -246,6 +217,14 @@ func Trie(tx ethdb.Tx, slowChecks bool, quit <-chan struct{}) {
 				if !found {
 					panic(fmt.Errorf("key %x has state %016b, but there is no child %d,%x in state", k, hasState, i, seek))
 				}
+			}
+
+			select {
+			default:
+			case <-quit:
+				return
+			case <-logEvery.C:
+				log.Info("trie storage integrity", "key", fmt.Sprintf("%x", k))
 			}
 		}
 	}

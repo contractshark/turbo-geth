@@ -18,28 +18,17 @@ package types
 
 import (
 	"bytes"
-	"errors"
 	"math"
 	"math/big"
 	"reflect"
 	"testing"
 
-	"github.com/holiman/uint256"
 	"github.com/ledgerwatch/turbo-geth/common"
 	"github.com/ledgerwatch/turbo-geth/common/u256"
 	"github.com/ledgerwatch/turbo-geth/crypto"
 	"github.com/ledgerwatch/turbo-geth/params"
 	"github.com/ledgerwatch/turbo-geth/rlp"
 )
-
-func TestDecodeEmptyTypedReceipt(t *testing.T) {
-	input := []byte{0x80}
-	var r Receipt
-	err := rlp.DecodeBytes(input, &r)
-	if !errors.Is(err, errEmptyTypedReceipt) {
-		t.Fatal("wrong error:", err)
-	}
-}
 
 func TestLegacyReceiptDecoding(t *testing.T) {
 	tests := []struct {
@@ -92,6 +81,10 @@ func TestLegacyReceiptDecoding(t *testing.T) {
 			if dec.CumulativeGasUsed != receipt.CumulativeGasUsed {
 				t.Fatalf("Receipt CumulativeGasUsed mismatch, want %v, have %v", receipt.CumulativeGasUsed, dec.CumulativeGasUsed)
 			}
+			// rlp.Decode doesn't restore .Bloom field anymore because TG switched to bitmap indices, see dbutils.LogIndex
+			//if dec.Bloom != receipt.Bloom {
+			//	t.Fatalf("Bloom data mismatch, want %x, have %x", receipt.Bloom, dec.Bloom)
+			//}
 			if len(dec.Logs) != len(receipt.Logs) {
 				t.Fatalf("Receipt log number mismatch, want %v, have %v", len(receipt.Logs), len(dec.Logs))
 			}
@@ -125,29 +118,9 @@ func encodeAsStoredReceiptRLP(want *Receipt) ([]byte, error) {
 // Tests that receipt data can be correctly derived from the contextual infos
 func TestDeriveFields(t *testing.T) {
 	// Create a few transactions to have receipts for
-	to2 := common.HexToAddress("0x2")
-	to3 := common.HexToAddress("0x3")
 	txs := Transactions{
-		NewTx(&LegacyTx{
-			Nonce:    1,
-			Value:    uint256.NewInt().SetUint64(1),
-			Gas:      1,
-			GasPrice: uint256.NewInt().SetUint64(1),
-		}),
-		NewTx(&LegacyTx{
-			To:       &to2,
-			Nonce:    2,
-			Value:    uint256.NewInt().SetUint64(2),
-			Gas:      2,
-			GasPrice: uint256.NewInt().SetUint64(2),
-		}),
-		NewTx(&AccessListTx{
-			To:       &to3,
-			Nonce:    3,
-			Value:    uint256.NewInt().SetUint64(3),
-			Gas:      3,
-			GasPrice: uint256.NewInt().SetUint64(3),
-		}),
+		NewContractCreation(1, u256.Num1, 1, u256.Num1, nil),
+		NewTransaction(2, common.HexToAddress("0x2"), u256.Num2, 2, u256.Num2, nil),
 	}
 	// Create the corresponding receipts
 	receipts := Receipts{
@@ -173,25 +146,13 @@ func TestDeriveFields(t *testing.T) {
 			ContractAddress: common.BytesToAddress([]byte{0x02, 0x22, 0x22}),
 			GasUsed:         2,
 		},
-		&Receipt{
-			Type:              AccessListTxType,
-			PostState:         common.Hash{3}.Bytes(),
-			CumulativeGasUsed: 6,
-			Logs: []*Log{
-				{Address: common.BytesToAddress([]byte{0x33})},
-				{Address: common.BytesToAddress([]byte{0x03, 0x33})},
-			},
-			TxHash:          txs[2].Hash(),
-			ContractAddress: common.BytesToAddress([]byte{0x03, 0x33, 0x33}),
-			GasUsed:         3,
-		},
 	}
 	// Clear all the computed fields and re-derive them
 	number := big.NewInt(1)
 	hash := common.BytesToHash([]byte{0x03, 0x14})
 
 	clearComputedFieldsOnReceipts(t, receipts)
-	if err := receipts.DeriveFields(hash, number.Uint64(), txs, []common.Address{common.BytesToAddress([]byte{0x0}), common.BytesToAddress([]byte{0x0}), common.BytesToAddress([]byte{0x0})}); err != nil {
+	if err := receipts.DeriveFields(hash, number.Uint64(), txs, []common.Address{common.BytesToAddress([]byte{0x0}), common.BytesToAddress([]byte{0x0})}); err != nil {
 		t.Fatalf("DeriveFields(...) = %v, want <nil>", err)
 	}
 	// Iterate over all the computed fields and check that they're correct
@@ -199,9 +160,6 @@ func TestDeriveFields(t *testing.T) {
 
 	logIndex := uint(0)
 	for i := range receipts {
-		if receipts[i].Type != txs[i].Type() {
-			t.Errorf("receipts[%d].Type = %d, want %d", i, receipts[i].Type, txs[i].Type())
-		}
 		if receipts[i].TxHash != txs[i].Hash() {
 			t.Errorf("receipts[%d].TxHash = %s, want %s", i, receipts[i].TxHash.String(), txs[i].Hash().String())
 		}
@@ -246,36 +204,6 @@ func TestDeriveFields(t *testing.T) {
 			}
 			logIndex++
 		}
-	}
-}
-
-// TestTypedReceiptEncodingDecoding reproduces a flaw that existed in the receipt
-// rlp decoder, which failed due to a shadowing error.
-func TestTypedReceiptEncodingDecoding(t *testing.T) {
-	var payload = common.FromHex("f9043eb9010c01f90108018262d4b9010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c0b9010c01f901080182cd14b9010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c0b9010d01f901090183013754b9010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c0b9010d01f90109018301a194b9010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c0")
-	check := func(bundle []*Receipt) {
-		t.Helper()
-		for i, receipt := range bundle {
-			if got, want := receipt.Type, uint8(1); got != want {
-				t.Fatalf("bundle %d: got %x, want %x", i, got, want)
-			}
-		}
-	}
-	{
-		var bundle []*Receipt
-		if err := rlp.DecodeBytes(payload, &bundle); err != nil {
-			t.Fatal(err)
-		}
-		check(bundle)
-	}
-	{
-		var bundle []*Receipt
-		r := bytes.NewReader(payload)
-		s := rlp.NewStream(r, uint64(len(payload)))
-		if err := s.Decode(&bundle); err != nil {
-			t.Fatal(err)
-		}
-		check(bundle)
 	}
 }
 

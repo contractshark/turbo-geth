@@ -17,10 +17,25 @@
 package eth
 
 import (
+	"context"
 	"time"
+
+	"github.com/ledgerwatch/turbo-geth/common/dbutils"
+
+	"github.com/ledgerwatch/turbo-geth/common"
+	"github.com/ledgerwatch/turbo-geth/common/bitutil"
+	"github.com/ledgerwatch/turbo-geth/core"
+	"github.com/ledgerwatch/turbo-geth/core/bloombits"
+	"github.com/ledgerwatch/turbo-geth/core/rawdb"
+	"github.com/ledgerwatch/turbo-geth/core/types"
+	"github.com/ledgerwatch/turbo-geth/ethdb"
 )
 
 const (
+	// bloomServiceThreads is the number of goroutines used globally by an Ethereum
+	// instance to service bloombits lookups for all running filters.
+	bloomServiceThreads = 16
+
 	// bloomFilterThreads is the number of goroutines used locally per filter to
 	// multiplex requests onto the global servicing goroutines.
 	bloomFilterThreads = 3
@@ -33,3 +48,73 @@ const (
 	// to accumulate request an entire batch (avoiding hysteresis).
 	bloomRetrievalWait = time.Duration(0)
 )
+
+// startBloomHandlers starts a batch of goroutines to accept bloom bit database
+// retrievals from possibly a range of filters and serving the data to satisfy.
+func (eth *Ethereum) startBloomHandlers(sectionSize uint64) {
+}
+
+const (
+	// bloomThrottling is the time to wait between processing two consecutive index
+	// sections. It's useful during chain upgrades to prevent disk overload.
+	bloomThrottling = 100 * time.Millisecond
+)
+
+// BloomIndexer implements a core.ChainIndexer, building up a rotated bloom bits index
+// for the Ethereum header bloom filters, permitting blazing fast filtering.
+type BloomIndexer struct {
+	size    uint64               // section size to generate bloombits for
+	db      ethdb.Database       // database instance to write index data and metadata into
+	gen     *bloombits.Generator // generator to rotate the bloom bits crating the bloom index
+	section uint64               // Section is the section number being processed currently
+	head    common.Hash          // Head is the hash of the last header processed
+}
+
+// NewBloomIndexer returns a chain indexer that generates bloom bits data for the
+// canonical chain for fast logs filtering.
+func NewBloomIndexer(db ethdb.Database, size, confirms uint64) *core.ChainIndexer {
+	backend := &BloomIndexer{
+		db:   db,
+		size: size,
+	}
+
+	return core.NewChainIndexer(db, dbutils.BloomBitsIndexPrefix, backend, size, confirms, bloomThrottling, "bloombits")
+}
+
+// Reset implements core.ChainIndexerBackend, starting a new bloombits index
+// section.
+func (b *BloomIndexer) Reset(ctx context.Context, section uint64, lastSectionHead common.Hash) error {
+	gen, err := bloombits.NewGenerator(uint(b.size))
+	b.gen, b.section, b.head = gen, section, common.Hash{}
+	return err
+}
+
+// Process implements core.ChainIndexerBackend, adding a new header's bloom into
+// the index.
+func (b *BloomIndexer) Process(ctx context.Context, header *types.Header) error {
+	b.gen.AddBloom(uint(header.Number.Uint64()-b.section*b.size), header.Bloom)
+	b.head = header.Hash()
+	return nil
+}
+
+// Commit implements core.ChainIndexerBackend, finalizing the bloom section and
+// writing it out into the database.
+func (b *BloomIndexer) Commit(blockNr uint64) error {
+	batch := b.db.NewBatch()
+	for i := 0; i < types.BloomBitLength; i++ {
+		bits, err := b.gen.Bitset(uint(i))
+		if err != nil {
+			return err
+		}
+		if bits != nil {
+			rawdb.WriteBloomBits(batch, uint(i), b.section, b.head, bitutil.CompressBytes(bits))
+		}
+	}
+	_, err := batch.Commit()
+	return err
+}
+
+// Prune returns an empty error since we don't support pruning here.
+func (b *BloomIndexer) Prune(threshold uint64) error {
+	return nil
+}

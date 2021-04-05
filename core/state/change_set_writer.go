@@ -204,7 +204,7 @@ func (w *ChangeSetWriter) WriteHistory() error {
 	if err != nil {
 		return err
 	}
-	err = writeIndex(w.blockNumber, accountChanges, dbutils.AccountsHistoryBucket, w.db.(ethdb.HasTx).Tx().(ethdb.RwTx))
+	err = writeIndex(w.blockNumber, accountChanges, dbutils.AccountsHistoryBucket, w.db)
 	if err != nil {
 		return err
 	}
@@ -213,7 +213,7 @@ func (w *ChangeSetWriter) WriteHistory() error {
 	if err != nil {
 		return err
 	}
-	err = writeIndex(w.blockNumber, storageChanges, dbutils.StorageHistoryBucket, w.db.(ethdb.HasTx).Tx().(ethdb.RwTx))
+	err = writeIndex(w.blockNumber, storageChanges, dbutils.StorageHistoryBucket, w.db)
 	if err != nil {
 		return err
 	}

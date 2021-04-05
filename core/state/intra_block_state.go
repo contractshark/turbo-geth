@@ -24,6 +24,7 @@ import (
 	"sync"
 
 	"github.com/holiman/uint256"
+
 	"github.com/ledgerwatch/turbo-geth/common"
 	"github.com/ledgerwatch/turbo-geth/common/u256"
 	"github.com/ledgerwatch/turbo-geth/core/types"
@@ -37,6 +38,22 @@ import (
 type revision struct {
 	id           int
 	journalIndex int
+}
+
+var (
+	// emptyState is the known hash of an empty state trie entry.
+	emptyState = crypto.Keccak256Hash(nil)
+
+	// emptyCode is the known hash of the empty EVM bytecode.
+	// DESCRIBED: docs/programmers_guide/guide.md#code-hash
+	emptyCode = crypto.Keccak256Hash(nil)
+)
+
+type proofList [][]byte
+
+func (n *proofList) Put(key []byte, value []byte) error {
+	*n = append(*n, value)
+	return nil
 }
 
 type StateTracer interface {
@@ -166,6 +183,13 @@ func (sdb *IntraBlockState) SetTrace(trace bool) {
 	sdb.Lock()
 	defer sdb.Unlock()
 	sdb.trace = trace
+}
+
+// setError remembers the first non-nil error it is called with.
+func (sdb *IntraBlockState) setError(err error) {
+	sdb.Lock()
+	defer sdb.Unlock()
+	sdb.setErrorUnsafe(err)
 }
 
 // setErrorUnsafe sets error but should be called in medhods that already have locks
@@ -342,11 +366,6 @@ func (sdb *IntraBlockState) GetNonce(addr common.Address) uint64 {
 	return 0
 }
 
-// TxIndex returns the current transaction index set by Prepare.
-func (sdb *IntraBlockState) TxIndex() int {
-	return sdb.txIndex
-}
-
 // DESCRIBED: docs/programmers_guide/guide.md#address---identifier-of-an-account
 func (sdb *IntraBlockState) GetCode(addr common.Address) []byte {
 	sdb.Lock()
@@ -428,6 +447,30 @@ func (sdb *IntraBlockState) GetState(addr common.Address, key *common.Hash, valu
 	}
 }
 
+// GetProof returns the Merkle proof for a given account
+func (sdb *IntraBlockState) GetProof(a common.Address) ([][]byte, error) {
+	//sdb.Lock()
+	//defer sdb.Unlock()
+	//var proof proofList
+	//err := sdb.trie.Prove(crypto.Keccak256(a.Bytes()), 0, &proof)
+	//return [][]byte(proof), err
+	return nil, nil
+}
+
+// GetStorageProof returns the storage proof for a given key
+func (sdb *IntraBlockState) GetStorageProof(a common.Address, key common.Hash) ([][]byte, error) {
+	//sdb.Lock()
+	//defer sdb.Unlock()
+	//var proof proofList
+	//trie := sdb.StorageTrie(a)
+	//if trie == nil {
+	//	return proof, errors.New("storage trie for requested address does not exist")
+	//}
+	//err := trie.Prove(crypto.Keccak256(key.Bytes()), 0, &proof)
+	//return [][]byte(proof), err
+	return nil, nil
+}
+
 // GetCommittedState retrieves a value from the given account's committed storage trie.
 // DESCRIBED: docs/programmers_guide/guide.md#address---identifier-of-an-account
 func (sdb *IntraBlockState) GetCommittedState(addr common.Address, key *common.Hash, value *uint256.Int) {
@@ -467,6 +510,7 @@ func (sdb *IntraBlockState) HasSuicided(addr common.Address) bool {
 // DESCRIBED: docs/programmers_guide/guide.md#address---identifier-of-an-account
 func (sdb *IntraBlockState) AddBalance(addr common.Address, amount *uint256.Int) {
 	sdb.Lock()
+
 	if sdb.trace {
 		fmt.Printf("AddBalance %x, %d\n", addr, amount)
 	}
@@ -624,6 +668,9 @@ func (sdb *IntraBlockState) Suicide(addr common.Address) bool {
 
 	return true
 }
+
+var nullLocation = common.Hash{}
+var nullValue = common.Big0
 
 // do not lock!!!
 // Retrieve a state object given my the address. Returns nil if not found.
@@ -880,32 +927,6 @@ func (sdb *IntraBlockState) clearJournalAndRefund() {
 	sdb.journal = newJournal()
 	sdb.validRevisions = sdb.validRevisions[:0]
 	sdb.refund = 0
-}
-
-// PrepareAccessList handles the preparatory steps for executing a state transition with
-// regards to both EIP-2929 and EIP-2930:
-//
-// - Add sender to access list (2929)
-// - Add destination to access list (2929)
-// - Add precompiles to access list (2929)
-// - Add the contents of the optional tx access list (2930)
-//
-// This method should only be called if Yolov3/Berlin/2929+2930 is applicable at the current number.
-func (sdb *IntraBlockState) PrepareAccessList(sender common.Address, dst *common.Address, precompiles []common.Address, list types.AccessList) {
-	sdb.AddAddressToAccessList(sender)
-	if dst != nil {
-		sdb.AddAddressToAccessList(*dst)
-		// If it's a create-tx, the destination will be added inside evm.create
-	}
-	for _, addr := range precompiles {
-		sdb.AddAddressToAccessList(addr)
-	}
-	for _, el := range list {
-		sdb.AddAddressToAccessList(el.Address)
-		for _, key := range el.StorageKeys {
-			sdb.AddSlotToAccessList(el.Address, key)
-		}
-	}
 }
 
 // AddAddressToAccessList adds the given address to the access list

@@ -3,41 +3,43 @@ package stagedsync
 import (
 	"context"
 	"fmt"
+	"math/big"
+	"os"
 	"runtime"
 	"time"
 
-	"github.com/c2h5oh/datasize"
 	"github.com/ledgerwatch/turbo-geth/common"
+	"github.com/ledgerwatch/turbo-geth/common/dbutils"
 	"github.com/ledgerwatch/turbo-geth/core/rawdb"
 	"github.com/ledgerwatch/turbo-geth/core/types"
 	"github.com/ledgerwatch/turbo-geth/eth/stagedsync/stages"
 	"github.com/ledgerwatch/turbo-geth/ethdb"
 	"github.com/ledgerwatch/turbo-geth/log"
-	"github.com/ledgerwatch/turbo-geth/params"
+	"github.com/ledgerwatch/turbo-geth/rlp"
 	"github.com/ledgerwatch/turbo-geth/turbo/stages/headerdownload"
 )
 
 // HeadersForward progresses Headers stage in the forward direction
-func HeadersForward(
-	s *StageState,
-	u Unwinder,
-	ctx context.Context,
-	db ethdb.Database,
-	hd *headerdownload.HeaderDownload,
-	chainConfig *params.ChainConfig,
-	headerReqSend func(context.Context, *headerdownload.HeaderRequest) []byte,
-	initialCycle bool,
-	wakeUpChan chan struct{},
-	batchSize datasize.ByteSize,
-) error {
+func HeadersForward(s *StageState, ctx context.Context, db ethdb.Database, hd *headerdownload.HeaderDownload) error {
+	files, buffer := hd.PrepareStageData()
+	if len(files) == 0 && (buffer == nil || buffer.IsEmpty()) {
+		return nil
+	}
+
+	logPrefix := s.LogPrefix()
+
+	count := 0
+	var highest uint64
 	var headerProgress uint64
 	var err error
+	log.Info(fmt.Sprintf("[%s] Processing headers...", logPrefix), "from", headerProgress)
 	var tx ethdb.DbWithPendingMutations
 	var useExternalTx bool
 	if hasTx, ok := db.(ethdb.HasTx); ok && hasTx.Tx() != nil {
 		tx = db.(ethdb.DbWithPendingMutations)
 		useExternalTx = true
 	} else {
+		var err error
 		tx, err = db.Begin(context.Background(), ethdb.RW)
 		if err != nil {
 			return err
@@ -48,76 +50,110 @@ func HeadersForward(
 	if err != nil {
 		return err
 	}
-	logPrefix := s.LogPrefix()
-	// Check if this is called straight after the unwinds, which means we need to create new canonical markings
-	hash, err1 := rawdb.ReadCanonicalHash(tx, headerProgress)
-	if err1 != nil {
-		return err1
-	}
-	headHash := rawdb.ReadHeadHeaderHash(tx)
-	if hash == (common.Hash{}) {
-		if err = fixCanonicalChain(logPrefix, headerProgress, headHash, tx); err != nil {
-			return err
-		}
-		if !useExternalTx {
-			if err = tx.Commit(); err != nil {
-				return err
-			}
-		}
-		s.Done()
-		return nil
-	}
-
-	log.Info(fmt.Sprintf("[%s] Processing headers...", logPrefix), "from", headerProgress)
 	batch := tx.NewBatch()
 	defer batch.Rollback()
 	logEvery := time.NewTicker(logInterval)
 	defer logEvery.Stop()
+	var logBlock uint64
 
-	localTd, err1 := rawdb.ReadTd(tx, hash, headerProgress)
+	headHash := rawdb.ReadHeadHeaderHash(tx)
+	headNumber := rawdb.ReadHeaderNumber(tx, headHash)
+	localTd, err1 := rawdb.ReadTd(tx, headHash, *headNumber)
 	if err1 != nil {
 		return err1
 	}
-	headerInserter := headerdownload.NewHeaderInserter(logPrefix, batch, localTd, headerProgress)
-	hd.SetHeaderReader(&chainReader{config: chainConfig, batch: batch})
-
-	var req *headerdownload.HeaderRequest
-	var peer []byte
-	stopped := false
-	timer := time.NewTimer(1 * time.Second) // Check periodically even in the abseence of incoming messages
-	prevProgress := headerProgress
-	for !stopped {
-		currentTime := uint64(time.Now().Unix())
-		req = hd.RequestMoreHeaders(currentTime)
-		if req != nil {
-			peer = headerReqSend(ctx, req)
-			if peer != nil {
-				hd.SentRequest(req, currentTime, 5 /* timeout */)
-				//log.Info("Sent request", "height", req.Number)
+	var parentDiffs = make(map[common.Hash]*big.Int)
+	var childDiffs = make(map[common.Hash]*big.Int)
+	var prevHash common.Hash // Hash of previously seen header - to filter out potential duplicates
+	var prevHeight uint64
+	var newCanonical bool
+	var forkNumber uint64
+	var canonicalBacktrack = make(map[common.Hash]common.Hash)
+	if err1 = headerdownload.ReadFilesAndBuffer(files, buffer, func(header *types.Header, blockHeight uint64) error {
+		hash := header.Hash()
+		if hash == prevHash {
+			// Skip duplicates
+			return nil
+		}
+		if ch, err := rawdb.ReadCanonicalHash(tx, blockHeight); err == nil {
+			if ch == hash {
+				// Already canonical, skip
+				return nil
 			}
-		}
-		maxRequests := 64 // Limit number of requests sent per round to let some headers to be inserted into the database
-		for req != nil && peer != nil && maxRequests > 0 {
-			req = hd.RequestMoreHeaders(currentTime)
-			if req != nil {
-				peer = headerReqSend(ctx, req)
-				if peer != nil {
-					hd.SentRequest(req, currentTime, 5 /*timeout */)
-					//log.Info("Sent request", "height", req.Number)
-				}
-			}
-			maxRequests--
-		}
-		// Send skeleton request if required
-		req = hd.RequestSkeleton()
-		if req != nil {
-			peer = headerReqSend(ctx, req)
-		}
-		// Load headers into the database
-		if err = hd.InsertHeaders(headerInserter.FeedHeader); err != nil {
+		} else {
 			return err
 		}
-		if batch.BatchSize() >= int(batchSize) {
+		if blockHeight < prevHeight {
+			return fmt.Errorf("[%s] headers are unexpectedly unsorted, got %d after %d", logPrefix, blockHeight, prevHeight)
+		}
+		if forkNumber == 0 {
+			forkNumber = blockHeight
+			logBlock = blockHeight - 1
+		}
+		if blockHeight > prevHeight {
+			// Clear out parent map and move childMap to its place
+			if blockHeight == prevHeight+1 {
+				parentDiffs = childDiffs
+			}
+			childDiffs = make(map[common.Hash]*big.Int)
+			prevHeight = blockHeight
+		}
+		parentDiff, ok := parentDiffs[header.ParentHash]
+		if !ok {
+			var err error
+			if parentDiff, err = rawdb.ReadTd(tx, header.ParentHash, blockHeight-1); err != nil {
+				return fmt.Errorf("[%s] reading total difficulty of the parent header %d %x: %w", logPrefix, blockHeight-1, header.ParentHash, err)
+			}
+			if parentDiff == nil {
+				return fmt.Errorf("[%s] could not find parentDiff for %d", logPrefix, header.Number)
+			}
+		}
+		cumulativeDiff := new(big.Int).Add(parentDiff, header.Difficulty)
+		childDiffs[hash] = cumulativeDiff
+		if !newCanonical && cumulativeDiff.Cmp(localTd) > 0 {
+			newCanonical = true
+			backHash := header.ParentHash
+			backNumber := blockHeight - 1
+			for pHash, pOk := canonicalBacktrack[backHash]; pOk; pHash, pOk = canonicalBacktrack[backHash] {
+				if err := rawdb.WriteCanonicalHash(batch, backHash, backNumber); err != nil {
+					return fmt.Errorf("[%s] marking canonical header %d %x: %w", logPrefix, backNumber, backHash, err)
+				}
+				backHash = pHash
+				backNumber--
+			}
+			canonicalBacktrack = nil
+		}
+		if !newCanonical {
+			canonicalBacktrack[hash] = header.ParentHash
+		}
+		if newCanonical {
+			if err := rawdb.WriteCanonicalHash(batch, hash, blockHeight); err != nil {
+				return fmt.Errorf("[%s] marking canonical header %d %x: %w", logPrefix, blockHeight, hash, err)
+			}
+			if blockHeight > headerProgress {
+				headerProgress = blockHeight
+				if err := stages.SaveStageProgress(batch, stages.Headers, blockHeight); err != nil {
+					return fmt.Errorf("[%s] saving Headers progress: %w", logPrefix, err)
+				}
+			}
+			//rawdb.WriteHeadHeaderHash(batch, hash)
+		}
+		data, err := rlp.EncodeToBytes(header)
+		if err != nil {
+			return fmt.Errorf("[%s] Failed to RLP encode header: %w", logPrefix, err)
+		}
+		if err = rawdb.WriteTd(batch, hash, blockHeight, cumulativeDiff); err != nil {
+			return fmt.Errorf("[%s] Failed to WriteTd: %w", logPrefix, err)
+		}
+		if err = batch.Put(dbutils.HeaderPrefix, dbutils.HeaderKey(blockHeight, hash), data); err != nil {
+			return fmt.Errorf("[%s] Failed to store header: %w", logPrefix, err)
+		}
+		prevHash = hash
+		count++
+		if blockHeight > highest {
+			highest = blockHeight
+		}
+		if batch.BatchSize() >= batch.IdealBatchSize() {
 			if err = batch.CommitAndBegin(context.Background()); err != nil {
 				return err
 			}
@@ -127,118 +163,30 @@ func HeadersForward(
 				}
 			}
 		}
-		timer.Stop()
-		if !initialCycle && headerInserter.AnythingDone() {
-			// if this is not an initial cycle, we need to react quickly when new headers are coming in
-			break
-		}
-		timer = time.NewTimer(1 * time.Second)
 		select {
-		case <-ctx.Done():
-			stopped = true
+		default:
 		case <-logEvery.C:
-			progress := hd.Progress()
-			logProgressHeaders(logPrefix, prevProgress, progress, batch)
-			prevProgress = progress
-		case <-timer.C:
-			log.Debug("RequestQueueTime (header) ticked")
-		case <-wakeUpChan:
-			log.Debug("headerLoop woken up by the incoming request")
+			logBlock = logProgressHeaders(logPrefix, logBlock, blockHeight, batch)
 		}
-		if initialCycle && hd.InSync() {
-			fmt.Printf("Top seen height: %d\n", hd.TopSeenHeight())
-			break
-		}
+		return nil
+	}); err1 != nil {
+		return err1
 	}
-	if headerInserter.AnythingDone() {
-		if err := s.Update(tx, headerInserter.GetHighest()); err != nil {
-			return err
-		}
-	}
-	if headerInserter.UnwindPoint() < headerProgress {
-		if err := u.UnwindTo(headerInserter.UnwindPoint(), batch); err != nil {
-			return fmt.Errorf("%s: failed to unwind to %d: %w", logPrefix, headerInserter.UnwindPoint(), err)
-		}
-	} else {
-		if err := fixCanonicalChain(logPrefix, headerInserter.GetHighest(), headerInserter.GetHighestHash(), batch); err != nil {
-			return fmt.Errorf("%s: failed to fix canonical chain: %w", logPrefix, err)
-		}
-		if !stopped {
-			s.Done()
-		}
-	}
-	if err := batch.Commit(); err != nil {
+	if _, err := batch.Commit(); err != nil {
 		return fmt.Errorf("%s: failed to write batch commit: %v", logPrefix, err)
 	}
-	if !useExternalTx {
-		if err := tx.Commit(); err != nil {
-			return err
-		}
-	}
-	log.Info("Processed", "highest", headerInserter.GetHighest())
-	if stopped {
-		return fmt.Errorf("interrupted")
-	}
-	stageHeadersGauge.Update(int64(headerInserter.GetHighest()))
-	return nil
-}
-
-func fixCanonicalChain(logPrefix string, height uint64, hash common.Hash, tx ethdb.DbWithPendingMutations) error {
-	if height == 0 {
-		return nil
-	}
-	ancestorHash := hash
-	ancestorHeight := height
-	var ch common.Hash
-	var err error
-	for ch, err = rawdb.ReadCanonicalHash(tx, ancestorHeight); err == nil && ch != ancestorHash; ch, err = rawdb.ReadCanonicalHash(tx, ancestorHeight) {
-		if err = rawdb.WriteCanonicalHash(tx, ancestorHash, ancestorHeight); err != nil {
-			return fmt.Errorf("[%s] marking canonical header %d %x: %w", logPrefix, ancestorHeight, ancestorHash, err)
-		}
-		ancestor := rawdb.ReadHeader(tx, ancestorHash, ancestorHeight)
-		if ancestor == nil {
-			fmt.Printf("ancestor nil for %d %x\n", ancestorHeight, ancestorHash)
-		}
-		ancestorHash = ancestor.ParentHash
-		ancestorHeight--
-	}
-	if err != nil {
-		return fmt.Errorf("[%s] reading canonical hash for %d: %w", logPrefix, ancestorHeight, err)
-	}
-	return nil
-}
-
-func HeadersUnwind(u *UnwindState, s *StageState, db ethdb.Database) error {
-	var err error
-	var tx ethdb.DbWithPendingMutations
-	var useExternalTx bool
-	if hasTx, ok := db.(ethdb.HasTx); ok && hasTx.Tx() != nil {
-		tx = db.(ethdb.DbWithPendingMutations)
-		useExternalTx = true
-	} else {
-		tx, err = db.Begin(context.Background(), ethdb.RW)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback()
-	}
-	// Delete canonical hashes that are being unwound
-	var headerProgress uint64
-	headerProgress, err = stages.GetStageProgress(db, stages.Headers)
-	if err != nil {
-		return err
-	}
-	for blockHeight := headerProgress; blockHeight > u.UnwindPoint; blockHeight-- {
-		if err = rawdb.DeleteCanonicalHash(tx, blockHeight); err != nil {
-			return err
-		}
-	}
-	if err = u.Skip(tx); err != nil {
+	if err := s.DoneAndUpdate(tx, highest); err != nil {
 		return err
 	}
 	if !useExternalTx {
-		if err := tx.Commit(); err != nil {
+		if _, err := tx.Commit(); err != nil {
 			return err
+		}
+	}
+	log.Info("Processed", "headers", count, "highest", highest)
+	for _, file := range files {
+		if err := os.Remove(file); err != nil {
+			log.Error("Could not remove", "file", file, "error", err)
 		}
 	}
 	return nil
@@ -258,18 +206,3 @@ func logProgressHeaders(logPrefix string, prev, now uint64, batch ethdb.DbWithPe
 
 	return now
 }
-
-type chainReader struct {
-	config *params.ChainConfig
-	batch  ethdb.DbWithPendingMutations
-}
-
-func (cr chainReader) Config() *params.ChainConfig  { return cr.config }
-func (cr chainReader) CurrentHeader() *types.Header { panic("") }
-func (cr chainReader) GetHeader(hash common.Hash, number uint64) *types.Header {
-	return rawdb.ReadHeader(cr.batch, hash, number)
-}
-func (cr chainReader) GetHeaderByNumber(number uint64) *types.Header {
-	return rawdb.ReadHeaderByNumber(cr.batch, number)
-}
-func (cr chainReader) GetHeaderByHash(hash common.Hash) *types.Header { panic("") }

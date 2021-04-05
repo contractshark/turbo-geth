@@ -37,6 +37,9 @@ type Config struct {
 	NoReceipts              bool   // Do not calculate receipts
 	ReadOnly                bool   // Do no perform any block finalisation
 
+	EWASMInterpreter string // External EWASM interpreter options
+	EVMInterpreter   string // External EVM interpreter options
+
 	ExtraEips []int // Additional EIPS that are to be enabled
 }
 
@@ -67,6 +70,7 @@ type Interpreter interface {
 type callCtx struct {
 	memory   *Memory
 	stack    *stack.Stack
+	rstack   *stack.ReturnStack
 	contract *Contract
 }
 
@@ -96,8 +100,8 @@ type EVMInterpreter struct {
 func NewEVMInterpreter(evm *EVM, cfg Config) *EVMInterpreter {
 	var jt *JumpTable
 	switch {
-	case evm.chainRules.IsBerlin:
-		jt = &berlinInstructionSet
+	case evm.chainRules.IsYoloV2:
+		jt = &yoloV2InstructionSet
 	case evm.chainRules.IsIstanbul:
 		jt = &istanbulInstructionSet
 	case evm.chainRules.IsConstantinople:
@@ -161,9 +165,11 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 		op          OpCode        // current opcode
 		mem         = NewMemory() // bound memory
 		locStack    = stack.New()
+		returns     = stack.NewReturnStack() // local returns stack
 		callContext = &callCtx{
 			memory:   mem,
 			stack:    locStack,
+			rstack:   returns,
 			contract: contract,
 		}
 		// For optimisation reason we're using uint64 as the program counter.
@@ -182,6 +188,7 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 	// they are returned to the pools
 	defer func() {
 		stack.ReturnNormalStack(locStack)
+		stack.ReturnRStack(returns)
 	}()
 	contract.Input = input
 
@@ -189,9 +196,9 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 		defer func() {
 			if err != nil {
 				if !logged {
-					in.cfg.Tracer.CaptureState(in.evm, pcCopy, op, gasCopy, cost, mem, locStack, in.returnData, contract, in.evm.depth, err) //nolint:errcheck
+					in.cfg.Tracer.CaptureState(in.evm, pcCopy, op, gasCopy, cost, mem, locStack, returns, in.returnData, contract, in.evm.depth, err) //nolint:errcheck
 				} else {
-					_ = in.cfg.Tracer.CaptureFault(in.evm, pcCopy, op, gasCopy, cost, mem, locStack, contract, in.evm.depth, err)
+					_ = in.cfg.Tracer.CaptureFault(in.evm, pcCopy, op, gasCopy, cost, mem, locStack, returns, contract, in.evm.depth, err)
 				}
 			}
 		}()
@@ -274,7 +281,7 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 		}
 
 		if in.cfg.Debug {
-			in.cfg.Tracer.CaptureState(in.evm, pc, op, gasCopy, cost, mem, locStack, in.returnData, contract, in.evm.depth, err) //nolint:errcheck
+			in.cfg.Tracer.CaptureState(in.evm, pc, op, gasCopy, cost, mem, locStack, returns, in.returnData, contract, in.evm.depth, err) //nolint:errcheck
 			logged = true
 		}
 

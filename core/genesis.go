@@ -28,6 +28,7 @@ import (
 	"strings"
 
 	"github.com/holiman/uint256"
+
 	"github.com/ledgerwatch/turbo-geth/common"
 	"github.com/ledgerwatch/turbo-geth/common/dbutils"
 	"github.com/ledgerwatch/turbo-geth/common/hexutil"
@@ -40,7 +41,6 @@ import (
 	"github.com/ledgerwatch/turbo-geth/log"
 	"github.com/ledgerwatch/turbo-geth/params"
 	"github.com/ledgerwatch/turbo-geth/rlp"
-	"github.com/ledgerwatch/turbo-geth/turbo/trie"
 )
 
 //go:generate gencodec -type Genesis -field-override genesisSpecMarshaling -out gen_genesis.go
@@ -155,18 +155,15 @@ func (e *GenesisMismatchError) Error() string {
 // error is a *params.ConfigCompatError and the new, unwritten config is returned.
 //
 // The returned chain configuration is never nil.
-func SetupGenesisBlock(db ethdb.Database, genesis *Genesis, history bool, overwrite bool) (*params.ChainConfig, common.Hash, error) {
-	return SetupGenesisBlockWithOverride(db, genesis, nil, history, overwrite)
-}
-
-func SetupGenesisBlockWithOverride(db ethdb.Database, genesis *Genesis, overrideBerlin *big.Int, history bool, overwrite bool) (*params.ChainConfig, common.Hash, error) {
+func SetupGenesisBlock(db ethdb.Database, genesis *Genesis, history bool, overwrite bool) (*params.ChainConfig, common.Hash, *state.IntraBlockState, error) {
+	var stateDB *state.IntraBlockState
 	if genesis != nil && genesis.Config == nil {
-		return params.AllEthashProtocolChanges, common.Hash{}, ErrGenesisNoConfig
+		return params.AllEthashProtocolChanges, common.Hash{}, stateDB, ErrGenesisNoConfig
 	}
 	// Just commit the new block if there is no stored genesis block.
-	stored, storedErr := rawdb.ReadCanonicalHash(db, 0)
-	if storedErr != nil {
-		return nil, common.Hash{}, storedErr
+	stored, err := rawdb.ReadCanonicalHash(db, 0)
+	if err != nil {
+		return nil, common.Hash{}, nil, err
 	}
 	if overwrite || (stored == common.Hash{}) {
 		if genesis == nil {
@@ -175,64 +172,63 @@ func SetupGenesisBlockWithOverride(db ethdb.Database, genesis *Genesis, override
 		} else {
 			log.Info("Writing custom genesis block")
 		}
-		block, _, err1 := genesis.Commit(db, history)
-		if err1 != nil {
-			return genesis.Config, common.Hash{}, err1
+		block, stateDB1, err := genesis.Commit(db, history)
+		if err != nil {
+			return genesis.Config, common.Hash{}, nil, err
 		}
-		return genesis.Config, block.Hash(), nil
+		return genesis.Config, block.Hash(), stateDB1, nil
 	}
+
 	// Check whether the genesis block is already written.
 	if genesis != nil {
-		block, _, err1 := genesis.ToBlock(history)
-		if err1 != nil {
-			return genesis.Config, common.Hash{}, err1
+		block, stateDB1, _, err := genesis.ToBlock(nil, history)
+		if err != nil {
+			return genesis.Config, common.Hash{}, nil, err
 		}
 		hash := block.Hash()
 		if hash != stored {
-			return genesis.Config, block.Hash(), &GenesisMismatchError{stored, hash}
+			return genesis.Config, block.Hash(), stateDB1, &GenesisMismatchError{stored, hash}
 		}
 	}
+
 	// Get the existing chain configuration.
 	newcfg := genesis.configOrDefault(stored)
-	if overrideBerlin != nil {
-		newcfg.BerlinBlock = overrideBerlin
-	}
 	if err := newcfg.CheckConfigForkOrder(); err != nil {
-		return newcfg, common.Hash{}, err
+		return newcfg, common.Hash{}, nil, err
 	}
-	storedcfg, storedErr := rawdb.ReadChainConfig(db, stored)
-	if storedErr != nil {
-		return newcfg, common.Hash{}, storedErr
+	storedcfg, err := rawdb.ReadChainConfig(db, stored)
+	if err != nil {
+		return newcfg, common.Hash{}, nil, err
 	}
 	if overwrite || storedcfg == nil {
 		log.Warn("Found genesis block without chain config")
 		err1 := rawdb.WriteChainConfig(db, stored, newcfg)
 		if err1 != nil {
-			return newcfg, common.Hash{}, err1
+			return newcfg, common.Hash{}, nil, err1
 		}
-		return newcfg, stored, nil
+		return newcfg, stored, stateDB, nil
 	}
 	// Special case: don't change the existing config of a non-mainnet chain if no new
 	// config is supplied. These chains would get AllProtocolChanges (and a compat error)
 	// if we just continued here.
 	if genesis == nil && stored != params.MainnetGenesisHash {
-		return storedcfg, stored, nil
+		return storedcfg, stored, stateDB, nil
 	}
+
 	// Check config compatibility and write the config. Compatibility errors
 	// are returned to the caller unless we're already at block zero.
 	height := rawdb.ReadHeaderNumber(db, rawdb.ReadHeadHeaderHash(db))
 	if height == nil {
-		//return newcfg, stored, stateDB, fmt.Errorf("missing block number for head header hash")
-	} else {
-		compatErr := storedcfg.CheckCompatible(newcfg, *height)
-		if compatErr != nil && *height != 0 && compatErr.RewindTo != 0 {
-			return newcfg, stored, compatErr
-		}
+		return newcfg, stored, stateDB, fmt.Errorf("missing block number for head header hash")
+	}
+	compatErr := storedcfg.CheckCompatible(newcfg, *height)
+	if compatErr != nil && *height != 0 && compatErr.RewindTo != 0 {
+		return newcfg, stored, stateDB, compatErr
 	}
 	if err := rawdb.WriteChainConfig(db, stored, newcfg); err != nil {
-		return newcfg, common.Hash{}, err
+		return newcfg, common.Hash{}, nil, err
 	}
-	return newcfg, stored, nil
+	return newcfg, stored, stateDB, nil
 }
 
 func (g *Genesis) configOrDefault(ghash common.Hash) *params.ChainConfig {
@@ -247,8 +243,8 @@ func (g *Genesis) configOrDefault(ghash common.Hash) *params.ChainConfig {
 		return params.RinkebyChainConfig
 	case ghash == params.GoerliGenesisHash:
 		return params.GoerliChainConfig
-	case ghash == params.YoloV3GenesisHash:
-		return params.YoloV3ChainConfig
+	case ghash == params.YoloV2GenesisHash:
+		return params.YoloV2ChainConfig
 	default:
 		return params.AllEthashProtocolChanges
 	}
@@ -256,11 +252,15 @@ func (g *Genesis) configOrDefault(ghash common.Hash) *params.ChainConfig {
 
 // ToBlock creates the genesis block and writes state of a genesis specification
 // to the given database (or discards it if nil).
-func (g *Genesis) ToBlock(history bool) (*types.Block, *state.IntraBlockState, error) {
-	tmpDB := ethdb.NewMemDatabase()
-	defer tmpDB.Close()
-	r, w := state.NewDbStateReader(tmpDB), state.NewDbStateWriter(tmpDB, 0)
-	statedb := state.New(r)
+func (g *Genesis) ToBlock(db ethdb.Database, history bool) (*types.Block, *state.IntraBlockState, *state.TrieDbState, error) {
+	if db == nil {
+		db = ethdb.NewMemDatabase()
+	}
+	tds := state.NewTrieDbState(common.Hash{}, db, 0)
+
+	tds.StartNewBuffer()
+	statedb := state.New(tds)
+	tds.SetNoHistory(!history)
 	for addr, account := range g.Alloc {
 		balance, _ := uint256.FromBig(account.Balance)
 		statedb.AddBalance(addr, balance)
@@ -275,14 +275,24 @@ func (g *Genesis) ToBlock(history bool) (*types.Block, *state.IntraBlockState, e
 		if len(account.Code) > 0 || len(account.Storage) > 0 {
 			statedb.SetIncarnation(addr, 1)
 		}
+		if len(account.Code) == 0 && len(account.Storage) > 0 {
+			// Special case for weird tests - inaccessible storage
+			var b [8]byte
+			binary.BigEndian.PutUint64(b[:], state.FirstContractIncarnation)
+			if err := db.Put(dbutils.IncarnationMapBucket, addr[:], b[:]); err != nil {
+				return nil, nil, nil, err
+			}
+		}
 	}
-	if err := statedb.FinalizeTx(context.Background(), w); err != nil {
-		return nil, nil, err
-	}
-	root, err := trie.CalcRoot("genesis", tmpDB)
+	err := statedb.FinalizeTx(context.Background(), tds.TrieStateWriter())
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
+	roots, err := tds.ComputeTrieRoots()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	root := roots[len(roots)-1]
 	head := &types.Header{
 		Number:     new(big.Int).SetUint64(g.Number),
 		Nonce:      types.EncodeNonce(g.Nonce),
@@ -303,30 +313,22 @@ func (g *Genesis) ToBlock(history bool) (*types.Block, *state.IntraBlockState, e
 		head.Difficulty = params.GenesisDifficulty
 	}
 
-	return types.NewBlock(head, nil, nil, nil), statedb, nil
+	return types.NewBlock(head, nil, nil, nil), statedb, tds, nil
 }
 
-func (g *Genesis) WriteGenesisState(tx ethdb.Database, history bool) (*types.Block, *state.IntraBlockState, error) {
-	block, statedb, err := g.ToBlock(history)
+func (g *Genesis) CommitGenesisState(db ethdb.Database, history bool) (*types.Block, *state.IntraBlockState, error) {
+	batch := db.NewBatch()
+	block, statedb, tds, err := g.ToBlock(batch, history)
 	if err != nil {
 		return nil, nil, err
 	}
-	for addr, account := range g.Alloc {
-		if len(account.Code) == 0 && len(account.Storage) > 0 {
-			// Special case for weird tests - inaccessible storage
-			var b [8]byte
-			binary.BigEndian.PutUint64(b[:], state.FirstContractIncarnation)
-			if err := tx.Put(dbutils.IncarnationMapBucket, addr[:], b[:]); err != nil {
-				return nil, nil, err
-			}
-		}
-	}
-
 	if block.Number().Sign() != 0 {
 		return nil, statedb, fmt.Errorf("can't commit genesis block with number > 0")
 	}
+	tds.SetBlockNr(0)
 
-	blockWriter := state.NewPlainStateWriter(tx, tx, 0)
+	var blockWriter state.WriterWithChangeSets
+	blockWriter = tds.PlainStateWriter()
 
 	if err := statedb.CommitBlock(context.Background(), blockWriter); err != nil {
 		return nil, statedb, fmt.Errorf("cannot write state: %v", err)
@@ -341,19 +343,19 @@ func (g *Genesis) WriteGenesisState(tx ethdb.Database, history bool) (*types.Blo
 			return nil, statedb, fmt.Errorf("cannot write history: %v", err)
 		}
 	}
+
+	if _, err := batch.Commit(); err != nil {
+		return nil, nil, err
+	}
 	return block, statedb, nil
 }
 
 // Commit writes the block and state of a genesis specification to the database.
 // The block is committed as the canonical head block.
 func (g *Genesis) Commit(db ethdb.Database, history bool) (*types.Block, *state.IntraBlockState, error) {
-	tx, dbErr := db.Begin(context.Background(), ethdb.RW)
-	if dbErr != nil {
-		return nil, nil, dbErr
-	}
-	block, statedb, err2 := g.WriteGenesisState(tx, history)
-	if err2 != nil {
-		return block, statedb, err2
+	block, statedb, err := g.CommitGenesisState(db, history)
+	if err != nil {
+		return block, statedb, err
 	}
 	config := g.Config
 	if config == nil {
@@ -362,28 +364,22 @@ func (g *Genesis) Commit(db ethdb.Database, history bool) (*types.Block, *state.
 	if err := config.CheckConfigForkOrder(); err != nil {
 		return nil, nil, err
 	}
-	if err := rawdb.WriteTd(tx, block.Hash(), block.NumberU64(), g.Difficulty); err != nil {
+	if err := rawdb.WriteTd(db, block.Hash(), block.NumberU64(), g.Difficulty); err != nil {
 		return nil, nil, err
 	}
-	if err := rawdb.WriteBlock(context.Background(), tx, block); err != nil {
+	if err := rawdb.WriteBlock(context.Background(), db, block); err != nil {
 		return nil, nil, err
 	}
-	if err := rawdb.WriteReceipts(tx, block.NumberU64(), nil); err != nil {
+	if err := rawdb.WriteReceipts(db, block.NumberU64(), nil); err != nil {
 		return nil, nil, err
 	}
-	if err := rawdb.WriteCanonicalHash(tx, block.Hash(), block.NumberU64()); err != nil {
+	if err := rawdb.WriteCanonicalHash(db, block.Hash(), block.NumberU64()); err != nil {
 		return nil, nil, err
 	}
-	rawdb.WriteHeadBlockHash(tx, block.Hash())
-	rawdb.WriteHeadFastBlockHash(tx, block.Hash())
-	if err := rawdb.WriteHeadHeaderHash(tx, block.Hash()); err != nil {
-		return nil, nil, err
-	}
-	if err := rawdb.WriteChainConfig(tx, block.Hash(), config); err != nil {
-		return nil, nil, err
-	}
-
-	if err := tx.Commit(); err != nil {
+	rawdb.WriteHeadBlockHash(db, block.Hash())
+	rawdb.WriteHeadFastBlockHash(db, block.Hash())
+	rawdb.WriteHeadHeaderHash(db, block.Hash())
+	if err := rawdb.WriteChainConfig(db, block.Hash(), config); err != nil {
 		return nil, nil, err
 	}
 	return block, statedb, nil
@@ -470,15 +466,15 @@ func DefaultGoerliGenesisBlock() *Genesis {
 	}
 }
 
-func DefaultYoloV3GenesisBlock() *Genesis {
-	// Full genesis: https://gist.github.com/holiman/c6ed9269dce28304ad176314caa75e97
+func DefaultYoloV2GenesisBlock() *Genesis {
+	// TODO: Update with yolov2 values + regenerate alloc data
 	return &Genesis{
-		Config:     params.YoloV3ChainConfig,
-		Timestamp:  0x6027dd2e,
-		ExtraData:  hexutil.MustDecode("0x00000000000000000000000000000000000000000000000000000000000000001041afbcb359d5a8dc58c15b2ff51354ff8a217d0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"),
+		Config:     params.YoloV2ChainConfig,
+		Timestamp:  0x5f91b932,
+		ExtraData:  hexutil.MustDecode("0x00000000000000000000000000000000000000000000000000000000000000008a37866fd3627c9205a37c8685666f32ec07bb1b0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"),
 		GasLimit:   0x47b760,
 		Difficulty: big.NewInt(1),
-		Alloc:      decodePrealloc(yoloV3AllocData),
+		Alloc:      decodePrealloc(yoloV1AllocData),
 	}
 }
 

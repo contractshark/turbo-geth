@@ -90,17 +90,22 @@ func TestEIP2200(t *testing.T) {
 
 			db := ethdb.NewMemDatabase()
 			defer db.Close()
-			s := state.New(state.NewPlainStateReader(db))
+			tds := state.NewTrieDbState(common.Hash{}, db, 0)
+			s := state.New(tds)
 			s.CreateAccount(address, true)
 			s.SetCode(address, hexutil.MustDecode(tt.input))
 			s.SetState(address, &common.Hash{}, *uint256.NewInt().SetUint64(uint64(tt.original)))
 
-			_ = s.CommitBlock(context.Background(), state.NewPlainStateWriter(db, db, 0))
-			vmctx := BlockContext{
+			_ = s.CommitBlock(context.Background(), tds.DbStateWriter())
+
+			// re-initialize the state
+			state := state.New(state.NewDbStateReader(db))
+
+			vmctx := Context{
 				CanTransfer: func(IntraBlockState, common.Address, *uint256.Int) bool { return true },
 				Transfer:    func(IntraBlockState, common.Address, common.Address, *uint256.Int, bool) {},
 			}
-			vmenv := NewEVM(vmctx, TxContext{}, s, params.AllEthashProtocolChanges, Config{ExtraEips: []int{2200}})
+			vmenv := NewEVM(vmctx, state, params.AllEthashProtocolChanges, Config{ExtraEips: []int{2200}})
 
 			_, gas, err := vmenv.Call(AccountRef(common.Address{}), address, nil, tt.gaspool, new(uint256.Int), false /* bailout */)
 			if !errors.Is(err, tt.failure) {

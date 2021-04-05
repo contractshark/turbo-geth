@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"fmt"
 	"runtime"
+	"sort"
 	"time"
 
+	"github.com/c2h5oh/datasize"
 	"github.com/ledgerwatch/turbo-geth/common"
 	"github.com/ledgerwatch/turbo-geth/eth/stagedsync/stages"
 	"github.com/ledgerwatch/turbo-geth/ethdb"
@@ -205,11 +207,48 @@ func (s *State) Run(db ethdb.GetterPutter, tx ethdb.GetterPutter) error {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
 	log.Info("Memory", "alloc", common.StorageSize(m.Alloc), "sys", common.StorageSize(m.Sys))
-	if len(timings) > 50 {
-		log.Info("Timings (first 50)", timings[:50]...)
-	} else {
-		log.Info("Timings", timings...)
+	log.Info("Timings", timings...)
+	if err := printBucketsSize(tx); err != nil {
+		return err
 	}
+	return nil
+}
+
+//nolint
+func printBucketsSize(dbTx ethdb.Getter) error {
+	hasTx, ok := dbTx.(ethdb.HasTx)
+	if !ok {
+		return nil
+	}
+	tx := hasTx.Tx()
+	if tx == nil {
+		return nil
+	}
+	buckets, err := tx.(ethdb.BucketMigrator).ExistingBuckets()
+	if err != nil {
+		return err
+	}
+	sort.Strings(buckets)
+	bucketSizes := make([]interface{}, 0, 2*len(buckets))
+	for _, bucket := range buckets {
+		sz, err1 := tx.BucketSize(bucket)
+		if err1 != nil {
+			return err1
+		}
+		if sz < uint64(10*datasize.GB) {
+			continue
+		}
+		bucketSizes = append(bucketSizes, bucket, common.StorageSize(sz))
+	}
+	if len(bucketSizes) == 0 {
+		return nil
+	}
+	sz, err1 := tx.BucketSize("freelist")
+	if err1 != nil {
+		return err1
+	}
+	bucketSizes = append(bucketSizes, "freelist", common.StorageSize(sz))
+	log.Info("Tables", bucketSizes...)
 	return nil
 }
 

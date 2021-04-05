@@ -152,17 +152,7 @@ func (w *PlainStateWriter) WriteHistory() error {
 	if err != nil {
 		return err
 	}
-	dbtx, externalTx := db.(ethdb.HasTx)
-	if !externalTx {
-		dbtx1, txErr := db.Begin(context.Background(), ethdb.RW)
-		if txErr != nil {
-			return txErr
-		}
-		defer dbtx1.Rollback()
-		dbtx = dbtx1.(ethdb.HasTx)
-	}
-	tx := dbtx.Tx().(ethdb.RwTx)
-	err = writeIndex(w.blockNumber, accountChanges, dbutils.AccountsHistoryBucket, tx)
+	err = writeIndex(w.blockNumber, accountChanges, dbutils.AccountsHistoryBucket, db)
 	if err != nil {
 		return err
 	}
@@ -171,13 +161,9 @@ func (w *PlainStateWriter) WriteHistory() error {
 	if err != nil {
 		return err
 	}
-	err = writeIndex(w.blockNumber, storageChanges, dbutils.StorageHistoryBucket, tx)
+	err = writeIndex(w.blockNumber, storageChanges, dbutils.StorageHistoryBucket, db)
 	if err != nil {
 		return err
-	}
-
-	if !externalTx {
-		tx.Commit()
 	}
 
 	return nil

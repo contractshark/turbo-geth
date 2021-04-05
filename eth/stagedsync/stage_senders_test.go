@@ -1,7 +1,7 @@
 package stagedsync
 
 import (
-	"context"
+	"math/big"
 	"testing"
 	"time"
 
@@ -18,12 +18,7 @@ import (
 )
 
 func TestSenders(t *testing.T) {
-	db := ethdb.NewMemDatabase()
-	defer db.Close()
-	tx, err := db.Begin(context.Background(), ethdb.RW)
-	require.NoError(t, err)
-	defer tx.Rollback()
-	require := require.New(t)
+	db, require := ethdb.NewMemDatabase(), require.New(t)
 	var testKey, _ = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
 	testAddr := crypto.PubkeyToAddress(testKey.PublicKey)
 
@@ -33,62 +28,32 @@ func TestSenders(t *testing.T) {
 		return r
 	}
 
-	// prepare tx so it works with our test
-	signer1 := types.MakeSigner(params.MainnetChainConfig, params.MainnetChainConfig.BerlinBlock)
-	require.NoError(rawdb.WriteBody(tx, common.HexToHash("01"), 1, &types.Body{
+	// prepare db so it works with our test
+	signer1 := types.MakeSigner(params.MainnetChainConfig, big.NewInt(int64(1)))
+	require.NoError(rawdb.WriteBody(db, common.HexToHash("01"), 1, &types.Body{
 		Transactions: []*types.Transaction{
-			mustSign(types.NewTx(&types.AccessListTx{
-				Nonce:    1,
-				To:       &testAddr,
-				Value:    u256.Num1,
-				Gas:      1,
-				GasPrice: u256.Num1,
-			}), signer1),
-			mustSign(types.NewTx(&types.AccessListTx{
-				Nonce:    2,
-				To:       &testAddr,
-				Value:    u256.Num1,
-				Gas:      2,
-				GasPrice: u256.Num1,
-			}), signer1),
+			mustSign(types.NewTransaction(1, testAddr, u256.Num1, 1, u256.Num1, nil), signer1),
+			mustSign(types.NewTransaction(2, testAddr, u256.Num1, 2, u256.Num1, nil), signer1),
 		},
 	}))
-	require.NoError(rawdb.WriteCanonicalHash(tx, common.HexToHash("01"), 1))
+	require.NoError(rawdb.WriteCanonicalHash(db, common.HexToHash("01"), 1))
 
-	signer2 := types.MakeSigner(params.MainnetChainConfig, params.MainnetChainConfig.BerlinBlock)
-	require.NoError(rawdb.WriteBody(tx, common.HexToHash("02"), 2, &types.Body{
+	signer2 := types.MakeSigner(params.MainnetChainConfig, big.NewInt(int64(1)))
+	require.NoError(rawdb.WriteBody(db, common.HexToHash("02"), 2, &types.Body{
 		Transactions: []*types.Transaction{
-			mustSign(types.NewTx(&types.AccessListTx{
-				Nonce:    3,
-				To:       &testAddr,
-				Value:    u256.Num1,
-				Gas:      3,
-				GasPrice: u256.Num1,
-			}), signer2),
-			mustSign(types.NewTx(&types.AccessListTx{
-				Nonce:    4,
-				To:       &testAddr,
-				Value:    u256.Num1,
-				Gas:      4,
-				GasPrice: u256.Num1,
-			}), signer2),
-			mustSign(types.NewTx(&types.AccessListTx{
-				Nonce:    5,
-				To:       &testAddr,
-				Value:    u256.Num1,
-				Gas:      5,
-				GasPrice: u256.Num1,
-			}), signer2),
+			mustSign(types.NewTransaction(3, testAddr, u256.Num1, 3, u256.Num1, nil), signer2),
+			mustSign(types.NewTransaction(4, testAddr, u256.Num1, 4, u256.Num1, nil), signer2),
+			mustSign(types.NewTransaction(5, testAddr, u256.Num1, 5, u256.Num1, nil), signer2),
 		},
 	}))
-	require.NoError(rawdb.WriteCanonicalHash(tx, common.HexToHash("02"), 2))
+	require.NoError(rawdb.WriteCanonicalHash(db, common.HexToHash("02"), 2))
 
-	require.NoError(rawdb.WriteBody(tx, common.HexToHash("03"), 3, &types.Body{
+	require.NoError(rawdb.WriteBody(db, common.HexToHash("03"), 3, &types.Body{
 		Transactions: []*types.Transaction{}, Uncles: []*types.Header{{GasLimit: 3}},
 	}))
-	require.NoError(rawdb.WriteCanonicalHash(tx, common.HexToHash("03"), 3))
+	require.NoError(rawdb.WriteCanonicalHash(db, common.HexToHash("03"), 3))
 
-	require.NoError(stages.SaveStageProgress(tx, stages.Bodies, 3))
+	require.NoError(stages.SaveStageProgress(db, stages.Bodies, 3))
 
 	cfg := Stage3Config{
 		BatchSize:       1024,
@@ -98,41 +63,38 @@ func TestSenders(t *testing.T) {
 		ReadChLen:       4,
 		Now:             time.Now(),
 	}
-	err = SpawnRecoverSendersStage(cfg, &StageState{Stage: stages.Senders}, tx, params.TestChainConfig, 3, "", nil)
+	err := SpawnRecoverSendersStage(cfg, &StageState{Stage: stages.Senders}, db, params.MainnetChainConfig, 3, "", nil)
 	assert.NoError(t, err)
 
 	{
-		found := rawdb.ReadBody(tx, common.HexToHash("01"), 1)
+		found := rawdb.ReadBody(db, common.HexToHash("01"), 1)
 		assert.NotNil(t, found)
 		assert.Equal(t, 2, len(found.Transactions))
-		found = rawdb.ReadBody(tx, common.HexToHash("02"), 2)
+		found = rawdb.ReadBody(db, common.HexToHash("02"), 2)
 		assert.NotNil(t, found)
 		assert.NotNil(t, 3, len(found.Transactions))
-		found = rawdb.ReadBody(tx, common.HexToHash("03"), 3)
+		found = rawdb.ReadBody(db, common.HexToHash("03"), 3)
 		assert.NotNil(t, found)
 		assert.NotNil(t, 0, len(found.Transactions))
 		assert.NotNil(t, 2, len(found.Uncles))
 	}
 
 	{
-		senders, err := rawdb.ReadSenders(tx, common.HexToHash("01"), 1)
-		assert.NoError(t, err)
+		senders := rawdb.ReadSenders(db, common.HexToHash("01"), 1)
 		assert.Equal(t, 2, len(senders))
-		senders, err = rawdb.ReadSenders(tx, common.HexToHash("02"), 2)
-		assert.NoError(t, err)
+		senders = rawdb.ReadSenders(db, common.HexToHash("02"), 2)
 		assert.Equal(t, 3, len(senders))
-		senders, err = rawdb.ReadSenders(tx, common.HexToHash("03"), 3)
-		assert.NoError(t, err)
+		senders = rawdb.ReadSenders(db, common.HexToHash("03"), 3)
 		assert.Equal(t, 0, len(senders))
 	}
 	{
-		txs, err := rawdb.ReadTransactions(tx, 0, 2)
+		txs, err := rawdb.ReadTransactions(db, 0, 2)
 		assert.NoError(t, err)
 		assert.Equal(t, 2, len(txs))
-		txs, err = rawdb.ReadTransactions(tx, 2, 3)
+		txs, err = rawdb.ReadTransactions(db, 2, 3)
 		assert.NoError(t, err)
 		assert.Equal(t, 3, len(txs))
-		txs, err = rawdb.ReadTransactions(tx, 0, 1024)
+		txs, err = rawdb.ReadTransactions(db, 0, 1024)
 		assert.NoError(t, err)
 		assert.Equal(t, 5, len(txs))
 	}

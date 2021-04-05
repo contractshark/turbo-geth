@@ -26,7 +26,6 @@ import (
 	"github.com/ledgerwatch/turbo-geth/common"
 	"github.com/ledgerwatch/turbo-geth/consensus/ethash"
 	"github.com/ledgerwatch/turbo-geth/core"
-	"github.com/ledgerwatch/turbo-geth/core/rawdb"
 	"github.com/ledgerwatch/turbo-geth/core/types"
 	"github.com/ledgerwatch/turbo-geth/core/vm"
 	"github.com/ledgerwatch/turbo-geth/crypto"
@@ -42,9 +41,9 @@ type testBackend struct {
 
 func (b *testBackend) HeaderByNumber(ctx context.Context, number rpc.BlockNumber) (*types.Header, error) {
 	if number == rpc.LatestBlockNumber {
-		return rawdb.ReadCurrentHeader(b.chain.ChainDb()), nil
+		return b.chain.CurrentBlock().Header(), nil
 	}
-	return rawdb.ReadHeaderByNumber(b.chain.ChainDb(), uint64(number)), nil
+	return b.chain.GetHeaderByNumber(uint64(number)), nil
 }
 
 func (b *testBackend) BlockByNumber(ctx context.Context, number rpc.BlockNumber) (*types.Block, error) {
@@ -66,7 +65,7 @@ func newTestBackend(t *testing.T) *testBackend {
 			Config: params.TestChainConfig,
 			Alloc:  core.GenesisAlloc{addr: {Balance: big.NewInt(math.MaxInt64)}},
 		}
-		signer = types.LatestSigner(gspec.Config)
+		signer = types.NewEIP155Signer(gspec.Config.ChainID)
 	)
 	engine := ethash.NewFaker()
 	db := ethdb.NewMemDatabase()
@@ -78,9 +77,9 @@ func newTestBackend(t *testing.T) *testBackend {
 	// Generate testing blocks
 	blocks, _, err := core.GenerateChain(params.TestChainConfig, genesis, engine, db, 32, func(i int, b *core.BlockGen) {
 		b.SetCoinbase(common.Address{1})
-		tx, txErr := types.SignTx(types.NewTransaction(b.TxNonce(addr), common.HexToAddress("deadbeef"), uint256.NewInt().SetUint64(100), 21000, uint256.NewInt().SetUint64(uint64(int64(i+1)*params.GWei)), nil), signer, key)
-		if txErr != nil {
-			t.Fatalf("failed to create tx: %v", txErr)
+		tx, err := types.SignTx(types.NewTransaction(b.TxNonce(addr), common.HexToAddress("deadbeef"), uint256.NewInt().SetUint64(100), 21000, uint256.NewInt().SetUint64(uint64(int64(i+1)*params.GWei)), nil), signer, key)
+		if err != nil {
+			t.Fatalf("failed to create tx: %v", err)
 		}
 		b.AddTx(tx)
 	}, false)

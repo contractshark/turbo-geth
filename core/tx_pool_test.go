@@ -36,6 +36,7 @@ import (
 	"github.com/ledgerwatch/turbo-geth/core/types"
 	"github.com/ledgerwatch/turbo-geth/crypto"
 	"github.com/ledgerwatch/turbo-geth/ethdb"
+	"github.com/ledgerwatch/turbo-geth/event"
 	"github.com/ledgerwatch/turbo-geth/params"
 )
 
@@ -47,6 +48,25 @@ func init() {
 	testTxPoolConfig = DefaultTxPoolConfig
 	testTxPoolConfig.Journal = ""
 	testTxPoolConfig.StartOnInit = true
+}
+
+type testBlockChain struct {
+	gasLimit      uint64
+	chainHeadFeed *event.Feed
+}
+
+func (bc *testBlockChain) CurrentBlock() *types.Block {
+	return types.NewBlock(&types.Header{
+		GasLimit: bc.gasLimit,
+	}, nil, nil, nil)
+}
+
+func (bc *testBlockChain) GetBlock(hash common.Hash, number uint64) *types.Block {
+	return bc.CurrentBlock()
+}
+
+func (bc *testBlockChain) SubscribeChainHeadEvent(ch chan<- ChainHeadEvent) event.Subscription {
+	return bc.chainHeadFeed.Subscribe(ch)
 }
 
 func transaction(nonce uint64, gaslimit uint64, key *ecdsa.PrivateKey) *types.Transaction {
@@ -146,6 +166,12 @@ func deriveSender(tx *types.Transaction) (common.Address, error) {
 	return types.Sender(types.HomesteadSigner{}, tx)
 }
 
+type testChain struct {
+	*testBlockChain
+	address common.Address
+	trigger *bool
+}
+
 // This test simulates a scenario where a new block is imported during a
 // state reset and tests whether the pending state is in sync with the
 // block head event that initiated the resetState().
@@ -230,18 +256,13 @@ func TestInvalidTransactions(t *testing.T) {
 	}
 
 	tx = transaction(1, 100000, key)
-	pool.gasPrice = newInt(1000)
+	pool.gasPrice = big.NewInt(1000)
 	if err := pool.AddRemote(tx); err != ErrUnderpriced {
 		t.Error("expected", ErrUnderpriced, "got", err)
 	}
 	if err := pool.AddLocal(tx); err != nil {
 		t.Error("expected", nil, "got", err)
 	}
-}
-
-func newInt(value int64) *uint256.Int {
-	v, _ := uint256.FromBig(big.NewInt(value))
-	return v
 }
 
 func TestTransactionQueue(t *testing.T) {
@@ -252,13 +273,7 @@ func TestTransactionQueue(t *testing.T) {
 	from, _ := deriveSender(tx)
 	pool.currentState.AddBalance(from, uint256.NewInt().SetUint64(1000))
 
-<<<<<<< HEAD
 	pool.enqueueTx(tx.Hash(), tx)
-=======
-	if _, err := pool.enqueueTx(tx.Hash(), tx, false, true); err != nil {
-		t.Fatal(err)
-	}
->>>>>>> Fix lints
 	<-pool.requestPromoteExecutables(newAccountSet(pool.signer, from))
 	if len(pool.pending) != 1 {
 		t.Error("expected valid txs to be 1 is", len(pool.pending))
@@ -267,13 +282,7 @@ func TestTransactionQueue(t *testing.T) {
 	tx = transaction(1, 100, key)
 	from, _ = deriveSender(tx)
 	pool.currentState.SetNonce(from, 2)
-<<<<<<< HEAD
 	pool.enqueueTx(tx.Hash(), tx)
-=======
-	if _, err := pool.enqueueTx(tx.Hash(), tx, false, true); err != nil {
-		t.Fatal(err)
-	}
->>>>>>> Fix lints
 
 	<-pool.requestPromoteExecutables(newAccountSet(pool.signer, from))
 	if _, ok := pool.pending[from].txs.items[tx.Nonce()]; ok {
@@ -293,21 +302,9 @@ func TestTransactionQueue2(t *testing.T) {
 	from, _ := deriveSender(tx1)
 	pool.currentState.AddBalance(from, uint256.NewInt().SetUint64(1000))
 
-<<<<<<< HEAD
 	pool.enqueueTx(tx1.Hash(), tx1)
 	pool.enqueueTx(tx2.Hash(), tx2)
 	pool.enqueueTx(tx3.Hash(), tx3)
-=======
-	if _, err := pool.enqueueTx(tx1.Hash(), tx1, false, true); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pool.enqueueTx(tx2.Hash(), tx2, false, true); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pool.enqueueTx(tx3.Hash(), tx3, false, true); err != nil {
-		t.Fatal(err)
-	}
->>>>>>> Fix lints
 
 	pool.promoteExecutables([]common.Address{from})
 	if len(pool.pending) != 1 {
@@ -462,22 +459,9 @@ func TestTransactionDropping(t *testing.T) {
 	pool.promoteTx(account, tx0.Hash(), tx0)
 	pool.promoteTx(account, tx1.Hash(), tx1)
 	pool.promoteTx(account, tx2.Hash(), tx2)
-<<<<<<< HEAD
 	pool.enqueueTx(tx10.Hash(), tx10)
 	pool.enqueueTx(tx11.Hash(), tx11)
 	pool.enqueueTx(tx12.Hash(), tx12)
-=======
-
-	if _, err := pool.enqueueTx(tx10.Hash(), tx10, false, true); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pool.enqueueTx(tx11.Hash(), tx11, false, true); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pool.enqueueTx(tx12.Hash(), tx12, false, true); err != nil {
-		t.Fatal(err)
-	}
->>>>>>> Fix lints, fork split test
 
 	// Check that pre and post validations leave the pool as is
 	if pool.pending[account].Len() != 3 {
@@ -1175,7 +1159,6 @@ func TestTransactionPendingMinimumAllowance(t *testing.T) {
 //
 // Note, local transactions are never allowed to be dropped.
 func TestTransactionPoolRepricing(t *testing.T) {
-	t.Skip("deadlock")
 	// Create the pool to test the pricing enforcement with
 	db := ethdb.NewMemDatabase()
 	defer db.Close()
@@ -1236,7 +1219,7 @@ func TestTransactionPoolRepricing(t *testing.T) {
 		t.Fatalf("pool internal state corrupted: %v", err)
 	}
 	// Reprice the pool and check that underpriced transactions get dropped
-	pool.SetGasPrice(newInt(2))
+	pool.SetGasPrice(big.NewInt(2))
 
 	pending, queued = pool.Stats()
 	if pending != 2 {
@@ -1353,13 +1336,13 @@ func TestTransactionPoolRepricingKeepsLocals(t *testing.T) {
 	validate()
 
 	// Reprice the pool and check that nothing is dropped
-	pool.SetGasPrice(newInt(2))
+	pool.SetGasPrice(big.NewInt(2))
 	validate()
 
-	pool.SetGasPrice(newInt(2))
-	pool.SetGasPrice(newInt(4))
-	pool.SetGasPrice(newInt(8))
-	pool.SetGasPrice(newInt(100))
+	pool.SetGasPrice(big.NewInt(2))
+	pool.SetGasPrice(big.NewInt(4))
+	pool.SetGasPrice(big.NewInt(8))
+	pool.SetGasPrice(big.NewInt(100))
 	validate()
 }
 
@@ -1969,13 +1952,7 @@ func benchmarkFuturePromotion(b *testing.B, size int) {
 
 	for i := 0; i < size; i++ {
 		tx := transaction(uint64(1+i), 100000, key)
-<<<<<<< HEAD
 		pool.enqueueTx(tx.Hash(), tx)
-=======
-		if _, err := pool.enqueueTx(tx.Hash(), tx, false, true); err != nil {
-			b.Fatal(err)
-		}
->>>>>>> Fix lints
 	}
 	// Benchmark the speed of pool validation
 	b.ResetTimer()
@@ -2065,7 +2042,6 @@ func TestBundles(t *testing.T) {
 		}
 		checkBundles(t, &pool, v.block, v.testTimestamp, v.expectedRes, v.expectedRemaining)
 	}
-<<<<<<< HEAD
 }
 
 func checkBundles(t *testing.T, pool *TxPool, block int64, timestamp uint64, expectedRes int, expectedRemaining int) {
@@ -2075,29 +2051,5 @@ func checkBundles(t *testing.T, pool *TxPool, block int64, timestamp uint64, exp
 	}
 	if len(pool.mevBundles) != expectedRemaining {
 		t.Fatalf("expected remaining bundles did not match got %d, expected %d", len(pool.mevBundles), expectedRemaining)
-=======
-	remotes := make([]*types.Transaction, 1000)
-	for i := 0; i < len(remotes); i++ {
-		remotes[i] = pricedTransaction(uint64(i), 100000, newInt(2), remoteKey) // Higher gasprice
-	}
-	// Benchmark importing the transactions into the queue
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		b.StopTimer()
-		pool, _, _ := setupTxPool()
-		pool.currentState.AddBalance(account, newInt(100000000))
-		for _, local := range locals {
-			if err := pool.AddLocal(local); err != nil {
-				b.Fatal(err)
-			}
-		}
-		b.StartTimer()
-		// Assign a high enough balance for testing
-		pool.currentState.AddBalance(remoteAddr, newInt(100000000))
-		for i := 0; i < len(remotes); i++ {
-			pool.AddRemotes([]*types.Transaction{remotes[i]})
-		}
-		pool.Stop()
->>>>>>> core tests compile now
 	}
 }

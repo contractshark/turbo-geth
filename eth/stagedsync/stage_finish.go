@@ -8,15 +8,19 @@ import (
 	"github.com/ledgerwatch/turbo-geth/log"
 )
 
-func NotifyNewHeaders(from, to uint64, notifier ChainEventNotifier, db ethdb.Database) error {
+func NotifyRpcDaemon(from, to uint64, notifier ChainEventNotifier, db ethdb.Database) error {
 	if notifier == nil {
 		log.Warn("rpc notifier is not set, rpc daemon won't be updated about headers")
 		return nil
 	}
 	for i := from; i <= to; i++ {
-		header := rawdb.ReadHeaderByNumber(db, i)
+		hash, err := rawdb.ReadCanonicalHash(db, i)
+		if err != nil {
+			return err
+		}
+		header := rawdb.ReadHeader(db, hash, i)
 		if header == nil {
-			return fmt.Errorf("could not find canonical header for number: %d", i)
+			return fmt.Errorf("could not find canonical header for hash: %x number: %d", hash, i)
 		}
 		notifier.OnNewHeader(header)
 	}

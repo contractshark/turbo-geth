@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math/big"
 	"runtime"
@@ -68,7 +69,7 @@ func SpawnCallTraces(s *StageState, db ethdb.Database, chainConfig *params.Chain
 		return err
 	}
 	if !useExternalTx {
-		if err := tx.Commit(); err != nil {
+		if _, err := tx.Commit(); err != nil {
 			return err
 		}
 	}
@@ -100,11 +101,11 @@ func promoteCallTraces(logPrefix string, tx ethdb.Database, startBlock, endBlock
 		select {
 		default:
 		case <-logEvery.C:
-			sz, err := tx.(ethdb.HasTx).Tx().(ethdb.HasStats).BucketSize(dbutils.CallFromIndex)
+			sz, err := tx.(ethdb.HasTx).Tx().BucketSize(dbutils.CallFromIndex)
 			if err != nil {
 				return err
 			}
-			sz2, err := tx.(ethdb.HasTx).Tx().(ethdb.HasStats).BucketSize(dbutils.CallToIndex)
+			sz2, err := tx.(ethdb.HasTx).Tx().BucketSize(dbutils.CallToIndex)
 			if err != nil {
 				return err
 			}
@@ -143,10 +144,7 @@ func promoteCallTraces(logPrefix string, tx ethdb.Database, startBlock, endBlock
 		if block == nil {
 			break
 		}
-		senders, errSenders := rawdb.ReadSenders(tx, blockHash, blockNum)
-		if errSenders != nil {
-			return errSenders
-		}
+		senders := rawdb.ReadSenders(tx, blockHash, blockNum)
 		block.Body().SendersToTxs(senders)
 
 		var stateReader state.StateReader
@@ -201,7 +199,7 @@ func promoteCallTraces(logPrefix string, tx ethdb.Database, startBlock, endBlock
 		copy(lastChunkKey, k)
 		binary.BigEndian.PutUint32(lastChunkKey[len(k):], ^uint32(0))
 		lastChunkBytes, err := table.Get(lastChunkKey)
-		if err != nil {
+		if err != nil && !errors.Is(err, ethdb.ErrKeyNotFound) {
 			return fmt.Errorf("%s: find last chunk failed: %w", logPrefix, err)
 		}
 
@@ -230,11 +228,11 @@ func promoteCallTraces(logPrefix string, tx ethdb.Database, startBlock, endBlock
 		return nil
 	}
 
-	if err := collectorFrom.Load(logPrefix, tx.(ethdb.HasTx).Tx().(ethdb.RwTx), dbutils.CallFromIndex, loaderFunc, etl.TransformArgs{Quit: quit}); err != nil {
+	if err := collectorFrom.Load(logPrefix, tx, dbutils.CallFromIndex, loaderFunc, etl.TransformArgs{Quit: quit}); err != nil {
 		return fmt.Errorf("[%s] %w", logPrefix, err)
 	}
 
-	if err := collectorTo.Load(logPrefix, tx.(ethdb.HasTx).Tx().(ethdb.RwTx), dbutils.CallToIndex, loaderFunc, etl.TransformArgs{Quit: quit}); err != nil {
+	if err := collectorTo.Load(logPrefix, tx, dbutils.CallToIndex, loaderFunc, etl.TransformArgs{Quit: quit}); err != nil {
 		return fmt.Errorf("[%s] %w", logPrefix, err)
 	}
 	return nil
@@ -265,7 +263,7 @@ func UnwindCallTraces(u *UnwindState, s *StageState, db ethdb.Database, chainCon
 	}
 
 	if !useExternalTx {
-		if err := tx.Commit(); err != nil {
+		if _, err := tx.Commit(); err != nil {
 			return fmt.Errorf("[%s] %w", logPrefix, err)
 		}
 	}
@@ -294,10 +292,7 @@ func unwindCallTraces(logPrefix string, db ethdb.Database, from, to uint64, chai
 		if block == nil {
 			break
 		}
-		senders, errSenders := rawdb.ReadSenders(db, blockHash, blockNum)
-		if errSenders != nil {
-			return errSenders
-		}
+		senders := rawdb.ReadSenders(db, blockHash, blockNum)
 		block.Body().SendersToTxs(senders)
 
 		stateReader := state.NewCachedReader(state.NewPlainDBState(db, blockNum-1), cache)
@@ -348,11 +343,11 @@ func NewCallTracer() *CallTracer {
 func (ct *CallTracer) CaptureStart(depth int, from common.Address, to common.Address, precompile bool, create bool, calltype vm.CallType, input []byte, gas uint64, value *big.Int) error {
 	return nil
 }
-func (ct *CallTracer) CaptureState(env *vm.EVM, pc uint64, op vm.OpCode, gas, cost uint64, memory *vm.Memory, stack *stack.Stack, rData []byte, contract *vm.Contract, depth int, err error) error {
+func (ct *CallTracer) CaptureState(env *vm.EVM, pc uint64, op vm.OpCode, gas, cost uint64, memory *vm.Memory, stack *stack.Stack, _ *stack.ReturnStack, rData []byte, contract *vm.Contract, depth int, err error) error {
 	//TODO: Populate froms and tos if it is any call opcode
 	return nil
 }
-func (ct *CallTracer) CaptureFault(env *vm.EVM, pc uint64, op vm.OpCode, gas, cost uint64, memory *vm.Memory, stack *stack.Stack, contract *vm.Contract, depth int, err error) error {
+func (ct *CallTracer) CaptureFault(env *vm.EVM, pc uint64, op vm.OpCode, gas, cost uint64, memory *vm.Memory, stack *stack.Stack, _ *stack.ReturnStack, contract *vm.Contract, depth int, err error) error {
 	return nil
 }
 func (ct *CallTracer) CaptureEnd(depth int, output []byte, gasUsed uint64, t time.Duration, err error) error {

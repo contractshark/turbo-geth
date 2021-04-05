@@ -49,13 +49,12 @@ func SpawnBlockHashStage(s *StageState, db ethdb.Database, tmpdir string, quit <
 	binary.BigEndian.PutUint64(startKey, s.BlockNumber)
 	endKey := dbutils.HeaderKey(headNumber, headHash) // Make sure we stop at head
 
-	//todo do we need non canonical headers ?
 	logPrefix := s.state.LogPrefix()
 	if err := etl.Transform(
 		logPrefix,
-		tx.(ethdb.HasTx).Tx().(ethdb.RwTx),
-		dbutils.HeadersBucket,
-		dbutils.HeaderNumberBucket,
+		tx,
+		dbutils.HeaderPrefix,
+		dbutils.HeaderNumberPrefix,
 		tmpdir,
 		extractHeaders,
 		etl.IdentityLoadFunc,
@@ -71,7 +70,7 @@ func SpawnBlockHashStage(s *StageState, db ethdb.Database, tmpdir string, quit <
 		return err
 	}
 	if !useExternalTx {
-		if err := tx.Commit(); err != nil {
+		if _, err := tx.Commit(); err != nil {
 			return err
 		}
 	}

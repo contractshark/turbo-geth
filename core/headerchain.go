@@ -36,6 +36,12 @@ import (
 	"github.com/ledgerwatch/turbo-geth/params"
 )
 
+const (
+	headerCacheLimit = 512
+	tdCacheLimit     = 1024
+	numberCacheLimit = 2048
+)
+
 // HeaderChain implements the basic block header chain logic that is shared by
 // core.BlockChain and light.LightChain. It is not usable in itself, only as
 // a part of either structure.
@@ -94,7 +100,7 @@ func NewHeaderChain(chainDb ethdb.Database, config *params.ChainConfig, engine c
 		}
 	}
 	hc.currentHeaderHash = hc.CurrentHeader().Hash()
-	//headHeaderGauge.Update(hc.CurrentHeader().Number.Int64())
+	headHeaderGauge.Update(hc.CurrentHeader().Number.Int64())
 
 	return hc, nil
 }
@@ -106,208 +112,134 @@ func (hc *HeaderChain) GetBlockNumber(dbr ethdb.Database, hash common.Hash) *uin
 	return number
 }
 
-type headerWriteResult struct {
-	status     WriteStatus
-	ignored    int
-	imported   int
-	lastHash   common.Hash
-	lastHeader *types.Header
-}
-
-// WriteHeaders writes a chain of headers into the local chain, given that the parents
-// are already known. If the total difficulty of the newly inserted chain becomes
-// greater than the current known TD, the canonical chain is reorged.
+// WriteHeader writes a header into the local chain, given that its parent is
+// already known. If the total difficulty of the newly inserted header becomes
+// greater than the current known TD, the canonical chain is re-routed.
 //
 // Note: This method is not concurrent-safe with inserting blocks simultaneously
 // into the chain, as side effects caused by reorganisations cannot be emulated
 // without the real blocks. Hence, writing headers directly should only be done
 // in two scenarios: pure-header mode of operation (light clients), or properly
 // separated header/block phases (non-archive clients).
-func (hc *HeaderChain) writeHeaders(headers []*types.Header) (result *headerWriteResult, err error) {
-	if len(headers) == 0 {
-		return &headerWriteResult{}, nil
-	}
-	ptd := hc.GetTd(hc.chainDb, headers[0].ParentHash, headers[0].Number.Uint64()-1)
+func (hc *HeaderChain) WriteHeader(ctx context.Context, header *types.Header) (status WriteStatus, err error) {
+	// Cache some values to prevent constant recalculation
+	var (
+		hash   = header.Hash()
+		number = header.Number.Uint64()
+	)
+	// Calculate the total difficulty of the header
+	ptd := hc.GetTd(hc.chainDb, header.ParentHash, number-1)
 	if ptd == nil {
-		return &headerWriteResult{}, consensus.ErrUnknownAncestor
+		return NonStatTy, consensus.ErrUnknownAncestor
 	}
-	var (
-		lastNumber = headers[0].Number.Uint64() - 1 // Last successfully imported number
-		lastHash   = headers[0].ParentHash          // Last imported header hash
-		newTD      = new(big.Int).Set(ptd)          // Total difficulty of inserted chain
+	head := hc.CurrentHeader().Number.Uint64()
+	localTd := hc.GetTd(hc.chainDb, hc.currentHeaderHash, head)
+	externTd := new(big.Int).Add(header.Difficulty, ptd)
 
-		lastHeader    *types.Header
-		inserted      []numberHash // Ephemeral lookup of number/hash for the chain
-		firstInserted = -1         // Index of the first non-ignored header
-	)
-
-	batch := hc.chainDb.NewBatch()
-	for i, header := range headers {
-		var hash common.Hash
-		// The headers have already been validated at this point, so we already
-		// know that it's a contiguous chain, where
-		// headers[i].Hash() == headers[i+1].ParentHash
-		if i < len(headers)-1 {
-			hash = headers[i+1].ParentHash
-		} else {
-			hash = header.Hash()
-		}
-		number := header.Number.Uint64()
-		newTD.Add(newTD, header.Difficulty)
-
-		// If the header is already known, skip it, otherwise store
-		if !hc.HasHeader(hash, number) {
-			// Irrelevant of the canonical status, write the TD and header to the database.
-			//nolint:errcheck
-			rawdb.WriteTd(batch, hash, number, newTD)
-			rawdb.WriteHeader(context.Background(), batch, header)
-			inserted = append(inserted, numberHash{number, hash})
-			if firstInserted < 0 {
-				firstInserted = i
-			}
-		}
-		lastHeader, lastHash, lastNumber = header, hash, number
+	// Irrelevant of the canonical status, write the td and header to the database
+	headerBatch := hc.chainDb.NewBatch()
+	if err := rawdb.WriteTd(headerBatch, hash, number, externTd); err != nil {
+		return NonStatTy, err
 	}
-
-	// Skip the slow disk write of all headers if interrupted.
-	if hc.procInterrupt() {
-		log.Debug("Premature abort during headers import")
-		return &headerWriteResult{}, errors.New("aborted")
+	rawdb.WriteHeader(ctx, headerBatch, header)
+	if _, err := headerBatch.Commit(); err != nil {
+		log.Crit("Failed to write header into disk", "err", err)
 	}
-	// Commit to disk!
-	if err := batch.CommitAndBegin(context.Background()); err != nil {
-		log.Crit("Failed to write headers", "error", err)
-	}
-
-	var (
-		head    = hc.CurrentHeader().Number.Uint64()
-		localTD = hc.GetTd(hc.chainDb, hc.currentHeaderHash, hc.CurrentHeader().Number.Uint64())
-		status  = SideStatTy
-	)
 	// If the total difficulty is higher than our known, add it to the canonical chain
 	// Second clause in the if statement reduces the vulnerability to selfish mining.
 	// Please refer to http://www.cs.cornell.edu/~ie53/publications/btcProcFC.pdf
-	reorg := newTD.Cmp(localTD) > 0
-	if !reorg && newTD.Cmp(localTD) == 0 {
-		if lastNumber < head {
+	reorg := externTd.Cmp(localTd) > 0
+	if !reorg && externTd.Cmp(localTd) == 0 {
+		if header.Number.Uint64() < head {
 			reorg = true
-		} else if lastNumber == head {
+		} else if header.Number.Uint64() == head {
 			reorg = mrand.Float64() < 0.5
 		}
 	}
-	// If the parent of the (first) block is already the canon header,
-	// we don't have to go backwards to delete canon blocks, but
-	// simply pile them onto the existing chain
-	chainAlreadyCanon := headers[0].ParentHash == hc.currentHeaderHash
 	if reorg {
 		// If the header can be added into canonical chain, adjust the
 		// header chain markers(canonical indexes and head header flag).
 		//
 		// Note all markers should be written atomically.
-		markerBatch := batch // we can reuse the batch to keep allocs down
-		if !chainAlreadyCanon {
-			// Delete any canonical number assignments above the new head
-			for i := lastNumber + 1; ; i++ {
-				hash, err := rawdb.ReadCanonicalHash(hc.chainDb, i)
-				if err != nil {
-					log.Crit("(reorg) Failed to read canonical hash", "error", err)
-				}
-				if hash == (common.Hash{}) {
-					break
-				}
-				//nolint:errcheck
-				rawdb.DeleteCanonicalHash(markerBatch, i)
-			}
-			// Overwrite any stale canonical number assignments, going
-			// backwards from the first header in this import
-			var (
-				headHash   = headers[0].ParentHash          // inserted[0].parent?
-				headNumber = headers[0].Number.Uint64() - 1 // inserted[0].num-1 ?
-				headHeader = hc.GetHeader(headHash, headNumber)
-			)
-			hash, err := rawdb.ReadCanonicalHash(hc.chainDb, headNumber)
-			if err != nil {
-				log.Crit("(reorg) Failed to read canonical hash", "error", err)
-			}
-			for hash != headHash {
-				err = rawdb.WriteCanonicalHash(markerBatch, headHash, headNumber)
-				if err != nil {
-					log.Crit("(reorg) Failed to write canonical hash", "error", err)
-				}
-				headHash = headHeader.ParentHash
-				headNumber = headHeader.Number.Uint64() - 1
-				headHeader = hc.GetHeader(headHash, headNumber)
 
-				hash, err = rawdb.ReadCanonicalHash(hc.chainDb, headNumber)
-				if err != nil {
-					log.Crit("(reorg) Failed to read canonical hash", "error", err)
-				}
+		// Delete any canonical number assignments above the new head
+		markerBatch := hc.chainDb.NewBatch()
+		for i := number + 1; ; i++ {
+			ch, err := rawdb.ReadCanonicalHash(hc.chainDb, i)
+			if err != nil {
+				return NonStatTy, err
 			}
-			// If some of the older headers were already known, but obtained canon-status
-			// during this import batch, then we need to write that now
-			// Further down, we continue writing the staus for the ones that
-			// were not already known
-			for i := 0; i < firstInserted; i++ {
-				hash := headers[i].Hash()
-				num := headers[i].Number.Uint64()
-				//nolint:errcheck
-				rawdb.WriteCanonicalHash(markerBatch, hash, num)
-				//nolint:errcheck
-				rawdb.WriteHeadHeaderHash(markerBatch, hash)
+			if ch == (common.Hash{}) {
+				break
+			}
+			err = rawdb.DeleteCanonicalHash(markerBatch, i)
+			if err != nil {
+				return NonStatTy, err
 			}
 		}
-		// Extend the canonical chain with the new headers
-		for _, hn := range inserted {
-			//nolint:errcheck
-			rawdb.WriteCanonicalHash(markerBatch, hn.hash, hn.number)
-			//nolint:errcheck
-			rawdb.WriteHeadHeaderHash(markerBatch, hn.hash)
+
+		// Overwrite any stale canonical number assignments
+		var (
+			headHash   = header.ParentHash
+			headNumber = header.Number.Uint64() - 1
+			headHeader = hc.GetHeader(headHash, headNumber)
+		)
+		for {
+			h, err := rawdb.ReadCanonicalHash(hc.chainDb, headNumber)
+			if err != nil {
+				return NonStatTy, err
+			}
+			if h == headHash {
+				break
+			}
+			err = rawdb.WriteCanonicalHash(markerBatch, headHash, headNumber)
+			if err != nil {
+				return NonStatTy, err
+			}
+
+			headHash = headHeader.ParentHash
+			headNumber = headHeader.Number.Uint64() - 1
+			headHeader = hc.GetHeader(headHash, headNumber)
 		}
-		if err := markerBatch.CommitAndBegin(context.Background()); err != nil {
+		// Extend the canonical chain with the new header
+		err = rawdb.WriteCanonicalHash(markerBatch, hash, number)
+		if err != nil {
+			return NonStatTy, err
+		}
+
+		rawdb.WriteHeadHeaderHash(markerBatch, hash)
+		if _, err := markerBatch.Commit(); err != nil {
 			log.Crit("Failed to write header markers into disk", "err", err)
 		}
 		// Last step update all in-memory head header markers
-		hc.currentHeaderHash = lastHash
-		hc.currentHeader.Store(types.CopyHeader(lastHeader))
-		//headHeaderGauge.Update(lastHeader.Number.Int64())
+		hc.currentHeaderHash = hash
+		hc.currentHeader.Store(types.CopyHeader(header))
+		headHeaderGauge.Update(header.Number.Int64())
 
-		// Chain status is canonical since this insert was a reorg.
-		// Note that all inserts which have higher TD than existing are 'reorg'.
 		status = CanonStatTy
+	} else {
+		status = SideStatTy
 	}
-
-	if len(inserted) == 0 {
-		status = NonStatTy
-	}
-	return &headerWriteResult{
-		status:     status,
-		ignored:    len(headers) - len(inserted),
-		imported:   len(inserted),
-		lastHash:   lastHash,
-		lastHeader: lastHeader,
-	}, nil
+	return
 }
+
+// WhCallback is a callback function for inserting individual headers.
+// A callback is used for two reasons: first, in a LightChain, status should be
+// processed and light chain events sent, while in a BlockChain this is not
+// necessary since chain events are sent after inserting blocks. Second, the
+// header writes should be protected by the parent chain mutex individually.
+type WhCallback func(*types.Header) error
 
 func (hc *HeaderChain) ValidateHeaderChain(chain []*types.Header, checkFreq int) (int, error) {
 	// Do a sanity check that the provided chain is actually ordered and linked
 	for i := 1; i < len(chain); i++ {
-		if chain[i].Number.Uint64() != chain[i-1].Number.Uint64()+1 {
-			hash := chain[i].Hash()
-			parentHash := chain[i-1].Hash()
+		if chain[i].Number.Uint64() != chain[i-1].Number.Uint64()+1 || chain[i].ParentHash != chain[i-1].Hash() {
 			// Chain broke ancestry, log a message (programming error) and skip insertion
-			log.Error("Non contiguous header insert", "number", chain[i].Number, "hash", hash,
-				"parent", chain[i].ParentHash, "prevnumber", chain[i-1].Number, "prevhash", parentHash)
+			log.Error("Non contiguous header insert", "number", chain[i].Number, "hash", chain[i].Hash(),
+				"parent", chain[i].ParentHash, "prevnumber", chain[i-1].Number, "prevhash", chain[i-1].Hash())
 
 			return 0, fmt.Errorf("non contiguous insert: item %d is #%d [%x…], item %d is #%d [%x…] (parent [%x…])", i-1, chain[i-1].Number,
-				parentHash.Bytes()[:4], i, chain[i].Number, hash.Bytes()[:4], chain[i].ParentHash[:4])
-		}
-		// If the header is a banned one, straight out abort
-		if BadHashes[chain[i].ParentHash] {
-			return i - 1, ErrBlacklistedHash
-		}
-		// If it's the last header in the cunk, we need to check it too
-		if i == len(chain)-1 && BadHashes[chain[i].Hash()] {
-			return i, ErrBlacklistedHash
+				chain[i-1].Hash().Bytes()[:4], i, chain[i].Number, chain[i].Hash().Bytes()[:4], chain[i].ParentHash[:4])
 		}
 	}
 
@@ -349,41 +281,55 @@ func (hc *HeaderChain) ValidateHeaderChain(chain []*types.Header, checkFreq int)
 	return 0, nil
 }
 
-// InsertHeaderChain inserts the given headers.
+// InsertHeaderChain attempts to insert the given header chain in to the local
+// chain, possibly creating a reorg. If an error is returned, it will return the
+// index number of the failing header as well an error describing what went wrong.
 //
-// The validity of the headers is NOT CHECKED by this method, i.e. they need to be
-// validated by ValidateHeaderChain before calling InsertHeaderChain.
-//
-// This insert is all-or-nothing. If this returns an error, no headers were written,
-// otherwise they were all processed successfully.
-//
-// The returned 'write status' says if the inserted headers are part of the canonical chain
-// or a side chain.
-func (hc *HeaderChain) InsertHeaderChain(chain []*types.Header, start time.Time) (WriteStatus, error) {
-	if hc.procInterrupt() {
-		return 0, errors.New("aborted")
-	}
-	res, err := hc.writeHeaders(chain)
-
-	// Report some public statistics so the user has a clue what's going on
-	context := []interface{}{
-		"count", res.imported,
-		"elapsed", common.PrettyDuration(time.Since(start)),
-	}
-	if err != nil {
-		context = append(context, "err", err)
-	}
-	if last := res.lastHeader; last != nil {
-		context = append(context, "number", last.Number, "hash", res.lastHash)
-		if timestamp := time.Unix(int64(last.Time), 0); time.Since(timestamp) > time.Minute {
-			context = append(context, []interface{}{"age", common.PrettyAge(timestamp)}...)
+// The verify parameter can be used to fine tune whether nonce verification
+// should be done or not. The reason behind the optional check is because some
+// of the header retrieval mechanisms already need to verfy nonces, as well as
+// because nonces can be verified sparsely, not needing to check each.
+func (hc *HeaderChain) InsertHeaderChain(chain []*types.Header, writeHeader WhCallback, start time.Time) (int, error) {
+	// Collect some import statistics to report on
+	stats := struct{ processed, ignored int }{}
+	// All headers passed verification, import them into the database
+	for i, header := range chain {
+		// Short circuit insertion if shutting down
+		if hc.procInterrupt() {
+			log.Debug("Premature abort during headers import")
+			return i, errors.New("aborted")
 		}
+		// If the header's already known, skip it, otherwise store
+		hash := header.Hash()
+		if hc.HasHeader(hash, header.Number.Uint64()) {
+			externTd := hc.GetTd(hc.chainDb, hash, header.Number.Uint64())
+			localTd := hc.GetTd(hc.chainDb, hc.currentHeaderHash, hc.CurrentHeader().Number.Uint64())
+			if externTd == nil || externTd.Cmp(localTd) <= 0 {
+				stats.ignored++
+				continue
+			}
+		}
+		if err := writeHeader(header); err != nil {
+			return i, err
+		}
+		stats.processed++
 	}
-	if res.ignored > 0 {
-		context = append(context, []interface{}{"ignored", res.ignored}...)
+	// Report some public statistics so the user has a clue what's going on
+	last := chain[len(chain)-1]
+
+	context := []interface{}{
+		"count", stats.processed, "elapsed", common.PrettyDuration(time.Since(start)),
+		"number", last.Number, "hash", last.Hash(),
+	}
+	if timestamp := time.Unix(int64(last.Time), 0); time.Since(timestamp) > time.Minute {
+		context = append(context, []interface{}{"age", common.PrettyAge(timestamp)}...)
+	}
+	if stats.ignored > 0 {
+		context = append(context, []interface{}{"ignored", stats.ignored}...)
 	}
 	log.Info("Imported new block headers", context...)
-	return res.status, err
+
+	return len(chain), nil
 }
 
 // GetBlockHashesFromHash retrieves a number of block hashes starting at a given
@@ -422,8 +368,9 @@ func (hc *HeaderChain) GetAncestor(hash common.Hash, number, ancestor uint64, ma
 		// in this case it is cheaper to just read the header
 		if header := hc.GetHeader(hash, number); header != nil {
 			return header.ParentHash, number - 1
+		} else {
+			return common.Hash{}, 0
 		}
-		return common.Hash{}, 0
 	}
 	for ancestor != 0 {
 		h, err := rawdb.ReadCanonicalHash(hc.chainDb, number)
@@ -525,7 +472,8 @@ func (hc *HeaderChain) GetCanonicalHash(number uint64) common.Hash {
 	return h
 }
 
-// CurrentHeader retrieves the current head header of the canonical chain.
+// CurrentHeader retrieves the current head header of the canonical chain. The
+// header is retrieved from the HeaderChain's internal cache.
 func (hc *HeaderChain) CurrentHeader() *types.Header {
 	headHash := rawdb.ReadHeadHeaderHash(hc.chainDb)
 	headNumber := rawdb.ReadHeaderNumber(hc.chainDb, headHash)
@@ -537,7 +485,7 @@ func (hc *HeaderChain) SetCurrentHeader(dbw ethdb.Putter, head *types.Header) {
 	rawdb.WriteHeadHeaderHash(dbw, head.Hash())
 	hc.currentHeader.Store(head)
 	hc.currentHeaderHash = head.Hash()
-	//headHeaderGauge.Update(head.Number.Int64())
+	headHeaderGauge.Update(head.Number.Int64())
 }
 
 type (
@@ -558,6 +506,7 @@ func (hc *HeaderChain) SetHead(head uint64, updateFn UpdateHeadBlocksCallback, d
 	var (
 		parentHash common.Hash
 		batch      = hc.chainDb.NewBatch()
+		origin     = true
 	)
 	for hdr := hc.CurrentHeader(); hdr != nil && hdr.Number.Uint64() > head; hdr = hc.CurrentHeader() {
 		num := hdr.Number.Uint64()
@@ -586,29 +535,47 @@ func (hc *HeaderChain) SetHead(head uint64, updateFn UpdateHeadBlocksCallback, d
 		}
 		// Update head header then.
 		rawdb.WriteHeadHeaderHash(markerBatch, parentHash)
-		if err := markerBatch.Commit(); err != nil {
+		if _, err := markerBatch.Commit(); err != nil {
 			log.Crit("Failed to update chain markers", "error", err)
 		}
 		hc.currentHeader.Store(parent)
 		hc.currentHeaderHash = parentHash
-		//headHeaderGauge.Update(parent.Number.Int64())
+		headHeaderGauge.Update(parent.Number.Int64())
+
+		// If this is the first iteration, wipe any leftover data upwards too so
+		// we don't end up with dangling daps in the database
+		var nums []uint64
+		if origin {
+			for n := num + 1; len(rawdb.ReadAllHashes(hc.chainDb, n)) > 0; n++ {
+				nums = append([]uint64{n}, nums...) // suboptimal, but we don't really expect this path
+			}
+			origin = false
+		}
+		nums = append(nums, num)
 
 		// Remove the related data from the database on all sidechains
-		// Gather all the side fork hashes
-		hash := hdr.Hash()
-		if delFn != nil {
-			delFn(batch, hash, num)
-		}
-		rawdb.DeleteHeader(batch, hash, num)
-		if err := rawdb.DeleteTd(batch, hash, num); err != nil {
-			panic(err)
-		}
-
-		if err := rawdb.DeleteCanonicalHash(batch, num); err != nil {
-			panic(err)
+		for _, num := range nums {
+			// Gather all the side fork hashes
+			hashes := rawdb.ReadAllHashes(hc.chainDb, num)
+			if len(hashes) == 0 {
+				// No hashes in the database whatsoever, probably frozen already
+				hashes = append(hashes, hdr.Hash())
+			}
+			for _, hash := range hashes {
+				if delFn != nil {
+					delFn(batch, hash, num)
+				}
+				rawdb.DeleteHeader(batch, hash, num)
+				if err := rawdb.DeleteTd(batch, hash, num); err != nil {
+					panic(err)
+				}
+			}
+			if err := rawdb.DeleteCanonicalHash(batch, num); err != nil {
+				panic(err)
+			}
 		}
 	}
-	if err := batch.Commit(); err != nil {
+	if _, err := batch.Commit(); err != nil {
 		panic(err)
 	}
 }

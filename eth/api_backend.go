@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"math/big"
 
+	"github.com/ledgerwatch/turbo-geth/accounts"
 	"github.com/ledgerwatch/turbo-geth/common"
 	"github.com/ledgerwatch/turbo-geth/consensus"
 	"github.com/ledgerwatch/turbo-geth/core"
@@ -34,16 +35,16 @@ import (
 	"github.com/ledgerwatch/turbo-geth/eth/gasprice"
 	"github.com/ledgerwatch/turbo-geth/ethdb"
 	"github.com/ledgerwatch/turbo-geth/event"
+	"github.com/ledgerwatch/turbo-geth/miner"
 	"github.com/ledgerwatch/turbo-geth/params"
 	"github.com/ledgerwatch/turbo-geth/rpc"
 )
 
 // EthAPIBackend implements ethapi.Backend for full nodes
 type EthAPIBackend struct {
-	extRPCEnabled       bool
-	allowUnprotectedTxs bool
-	eth                 *Ethereum
-	gpo                 *gasprice.Oracle
+	extRPCEnabled bool
+	eth           *Ethereum
+	gpo           *gasprice.Oracle
 }
 
 // ChainConfig returns the active chain configuration.
@@ -56,11 +57,17 @@ func (b *EthAPIBackend) CurrentBlock() *types.Block {
 }
 
 func (b *EthAPIBackend) SetHead(number uint64) {
-	b.eth.handler.downloader.Cancel()
+	b.eth.protocolManager.downloader.Cancel()
 	b.eth.blockchain.SetHead(number)
 }
 
 func (b *EthAPIBackend) resolveBlockNumber(blockNr rpc.BlockNumber) uint64 {
+	// Pending block is only known by the miner
+	if blockNr == rpc.PendingBlockNumber {
+		block := b.eth.miner.PendingBlock()
+		return block.NumberU64()
+	}
+
 	if blockNr == rpc.LatestBlockNumber {
 		return b.eth.blockchain.CurrentBlock().NumberU64()
 	}
@@ -68,6 +75,12 @@ func (b *EthAPIBackend) resolveBlockNumber(blockNr rpc.BlockNumber) uint64 {
 }
 
 func (b *EthAPIBackend) HeaderByNumber(ctx context.Context, blockNr rpc.BlockNumber) (*types.Header, error) {
+	// Pending block is only known by the miner
+	if blockNr == rpc.PendingBlockNumber {
+		block := b.eth.miner.PendingBlock()
+		return block.Header(), nil
+	}
+	// Otherwise resolve and return the block
 	bn := b.resolveBlockNumber(blockNr)
 	return b.eth.blockchain.GetHeaderByNumber(bn), nil
 }
@@ -94,6 +107,12 @@ func (b *EthAPIBackend) HeaderByHash(ctx context.Context, hash common.Hash) (*ty
 }
 
 func (b *EthAPIBackend) BlockByNumber(ctx context.Context, blockNr rpc.BlockNumber) (*types.Block, error) {
+	// Pending block is only known by the miner
+	if blockNr == rpc.PendingBlockNumber {
+		block := b.eth.miner.PendingBlock()
+		return block, nil
+	}
+	// Otherwise resolve and return the block
 	bn := b.resolveBlockNumber(blockNr)
 	return b.eth.blockchain.GetBlockByNumber(bn), nil
 }
@@ -124,6 +143,12 @@ func (b *EthAPIBackend) BlockByNumberOrHash(ctx context.Context, blockNrOrHash r
 }
 
 func (b *EthAPIBackend) StateAndHeaderByNumber(ctx context.Context, blockNr rpc.BlockNumber) (*state.IntraBlockState, *types.Header, error) {
+	// Pending state is only known by the miner
+	if blockNr == rpc.PendingBlockNumber {
+		block, state, _ := b.eth.miner.Pending()
+		return state, block.Header(), nil
+	}
+	// Otherwise resolve the block number and return its state
 	bn := b.resolveBlockNumber(blockNr)
 	header, err := b.HeaderByNumber(ctx, blockNr)
 	if err != nil {
@@ -231,13 +256,16 @@ func (b *EthAPIBackend) GetTd(ctx context.Context, hash common.Hash) *big.Int {
 func (b *EthAPIBackend) GetEVM(ctx context.Context, msg core.Message, state *state.IntraBlockState, header *types.Header) (*vm.EVM, func() error, error) {
 	vmError := func() error { return nil }
 
-	txContext := core.NewEVMTxContext(msg)
-	context := core.NewEVMBlockContext(header, b.eth.BlockChain(), nil)
-	return vm.NewEVM(context, txContext, state, b.eth.blockchain.Config(), *b.eth.blockchain.GetVMConfig()), vmError, nil
+	context := core.NewEVMContext(msg, header, b.eth.BlockChain(), nil)
+	return vm.NewEVM(context, state, b.eth.blockchain.Config(), *b.eth.blockchain.GetVMConfig()), vmError, nil
 }
 
 func (b *EthAPIBackend) SubscribeRemovedLogsEvent(ch chan<- core.RemovedLogsEvent) event.Subscription {
 	return b.eth.BlockChain().SubscribeRemovedLogsEvent(ch)
+}
+
+func (b *EthAPIBackend) SubscribePendingLogsEvent(ch chan<- []*types.Log) event.Subscription {
+	return b.eth.miner.SubscribePendingLogs(ch)
 }
 
 func (b *EthAPIBackend) SubscribeChainEvent(ch chan<- core.ChainEvent) event.Subscription {
@@ -309,6 +337,10 @@ func (b *EthAPIBackend) Downloader() *downloader.Downloader {
 	return b.eth.Downloader()
 }
 
+func (b *EthAPIBackend) ProtocolVersion() int {
+	return b.eth.EthVersion()
+}
+
 func (b *EthAPIBackend) SuggestPrice(ctx context.Context) (*big.Int, error) {
 	return b.gpo.SuggestPrice(ctx)
 }
@@ -317,12 +349,16 @@ func (b *EthAPIBackend) ChainDb() ethdb.Database {
 	return b.eth.ChainDb()
 }
 
-func (b *EthAPIBackend) ExtRPCEnabled() bool {
-	return b.extRPCEnabled
+func (b *EthAPIBackend) EventMux() *event.TypeMux {
+	return b.eth.EventMux()
 }
 
-func (b *EthAPIBackend) UnprotectedAllowed() bool {
-	return b.allowUnprotectedTxs
+func (b *EthAPIBackend) AccountManager() *accounts.Manager {
+	return b.eth.AccountManager()
+}
+
+func (b *EthAPIBackend) ExtRPCEnabled() bool {
+	return b.extRPCEnabled
 }
 
 func (b *EthAPIBackend) RPCGasCap() uint64 {
@@ -351,18 +387,10 @@ func (b *EthAPIBackend) CurrentHeader() *types.Header {
 	return b.eth.blockchain.CurrentHeader()
 }
 
+func (b *EthAPIBackend) Miner() *miner.Miner {
+	return b.eth.Miner()
+}
+
 func (b *EthAPIBackend) StartMining(threads int) error {
 	return b.eth.StartMining(threads)
-}
-
-func (b *EthAPIBackend) StateAtBlock(ctx context.Context, block *types.Block, reexec uint64) (*state.IntraBlockState, func(), error) {
-	return b.eth.stateAtBlock(block, reexec)
-}
-
-func (b *EthAPIBackend) StatesInRange(ctx context.Context, fromBlock *types.Block, toBlock *types.Block, reexec uint64) ([]*state.IntraBlockState, func(), error) {
-	return b.eth.statesInRange(fromBlock, toBlock, reexec)
-}
-
-func (b *EthAPIBackend) StateAtTransaction(ctx context.Context, block *types.Block, txIndex int, reexec uint64) (core.Message, vm.BlockContext, *state.IntraBlockState, func(), error) {
-	return b.eth.stateAtTransaction(block, txIndex, reexec)
 }

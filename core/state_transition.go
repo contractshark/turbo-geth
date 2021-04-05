@@ -24,8 +24,8 @@ import (
 	"github.com/holiman/uint256"
 
 	"github.com/ledgerwatch/turbo-geth/common"
-	"github.com/ledgerwatch/turbo-geth/core/types"
 	"github.com/ledgerwatch/turbo-geth/core/vm"
+	"github.com/ledgerwatch/turbo-geth/log"
 	"github.com/ledgerwatch/turbo-geth/params"
 )
 
@@ -70,7 +70,6 @@ type Message interface {
 	Nonce() uint64
 	CheckNonce() bool
 	Data() []byte
-	AccessList() types.AccessList
 }
 
 // ExecutionResult includes all output after executing given evm
@@ -109,10 +108,10 @@ func (result *ExecutionResult) Revert() []byte {
 }
 
 // IntrinsicGas computes the 'intrinsic gas' for a message with the given data.
-func IntrinsicGas(data []byte, accessList types.AccessList, isContractCreation bool, isHomestead, isEIP2028 bool) (uint64, error) {
+func IntrinsicGas(data []byte, contractCreation, isHomestead bool, isEIP2028 bool) (uint64, error) {
 	// Set the starting gas for the raw transaction
 	var gas uint64
-	if isContractCreation && isHomestead {
+	if contractCreation && isHomestead {
 		gas = params.TxGasContractCreation
 	} else {
 		gas = params.TxGas
@@ -141,10 +140,6 @@ func IntrinsicGas(data []byte, accessList types.AccessList, isContractCreation b
 			return 0, ErrGasUintOverflow
 		}
 		gas += z * params.TxDataZeroGas
-	}
-	if accessList != nil {
-		gas += uint64(len(accessList)) * params.TxAccessListAddressGas
-		gas += uint64(accessList.StorageKeys()) * params.TxAccessListStorageKeyGas
 	}
 	return gas, nil
 }
@@ -187,9 +182,9 @@ func (st *StateTransition) to() common.Address {
 func (st *StateTransition) buyGas(gasBailout bool) error {
 	mgval := new(big.Int).Mul(new(big.Int).SetUint64(st.msg.Gas()), st.gasPrice.ToBig())
 	gasCost, overflow := uint256.FromBig(mgval)
-	if have, want := st.state.GetBalance(st.msg.From()), mgval; overflow || st.state.GetBalance(st.msg.From()).Lt(gasCost) {
+	if overflow || st.state.GetBalance(st.msg.From()).Lt(gasCost) {
 		if !gasBailout {
-			return fmt.Errorf("%w: address %v have %v want %v", ErrInsufficientFunds, st.msg.From().Hex(), have, want)
+			return ErrInsufficientFunds
 		}
 	} else {
 		st.state.SubBalance(st.msg.From(), gasCost)
@@ -207,13 +202,13 @@ func (st *StateTransition) buyGas(gasBailout bool) error {
 func (st *StateTransition) preCheck(gasBailout bool) error {
 	// Make sure this transaction's nonce is correct.
 	if st.msg.CheckNonce() {
-		stNonce := st.state.GetNonce(st.msg.From())
-		if msgNonce := st.msg.Nonce(); stNonce < msgNonce {
-			return fmt.Errorf("%w: address %v, tx: %d state: %d", ErrNonceTooHigh,
-				st.msg.From().Hex(), msgNonce, stNonce)
-		} else if stNonce > msgNonce {
-			return fmt.Errorf("%w: address %v, tx: %d state: %d", ErrNonceTooLow,
-				st.msg.From().Hex(), msgNonce, stNonce)
+		nonce := st.state.GetNonce(st.msg.From())
+		if nonce < st.msg.Nonce() {
+			log.Error("Nonce too high", "from", fmt.Sprintf("0x%x", st.msg.From()), "state nonce", nonce, "tx nonce", st.msg.Nonce())
+			return ErrNonceTooHigh
+		} else if nonce > st.msg.Nonce() {
+			log.Error("Nonce too low", "from", fmt.Sprintf("0x%x", st.msg.From()), "state nonce", nonce, "tx nonce", st.msg.Nonce())
+			return ErrNonceTooLow
 		}
 	}
 	return st.buyGas(gasBailout)
@@ -249,34 +244,29 @@ func (st *StateTransition) TransitionDb(refunds bool, gasBailout bool) (*Executi
 	}
 	msg := st.msg
 	sender := vm.AccountRef(msg.From())
-	homestead := st.evm.ChainConfig().IsHomestead(st.evm.Context.BlockNumber)
-	istanbul := st.evm.ChainConfig().IsIstanbul(st.evm.Context.BlockNumber)
+	homestead := st.evm.ChainConfig().IsHomestead(st.evm.BlockNumber)
+	istanbul := st.evm.ChainConfig().IsIstanbul(st.evm.BlockNumber)
 	contractCreation := msg.To() == nil
 
 	// Check clauses 4-5, subtract intrinsic gas if everything is correct
-	gas, err := IntrinsicGas(st.data, st.msg.AccessList(), contractCreation, homestead, istanbul)
+	gas, err := IntrinsicGas(st.data, contractCreation, homestead, istanbul)
 	if err != nil {
 		return nil, err
 	}
 	if st.gas < gas {
-		return nil, fmt.Errorf("%w: have %d, want %d", ErrIntrinsicGas, st.gas, gas)
+		return nil, ErrIntrinsicGas
 	}
 	st.gas -= gas
 
 	// Check clause 6
 	var bailout bool
-	if !msg.Value().IsZero() && !st.evm.Context.CanTransfer(st.state, msg.From(), msg.Value()) {
+	if !msg.Value().IsZero() && !st.evm.CanTransfer(st.state, msg.From(), msg.Value()) {
 		if gasBailout {
 			bailout = true
 		} else {
-			return nil, fmt.Errorf("%w: address %v", ErrInsufficientFundsForTransfer, msg.From().Hex())
+			return nil, ErrInsufficientFundsForTransfer
 		}
 	}
-	// Set up the initial access list.
-	if st.evm.ChainConfig().IsBerlin(st.evm.Context.BlockNumber) {
-		st.state.PrepareAccessList(msg.From(), msg.To(), st.evm.ActivePrecompiles(), msg.AccessList())
-	}
-
 	var (
 		ret   []byte
 		vmerr error // vm errors do not effect consensus and are therefore not assigned to err
@@ -295,7 +285,7 @@ func (st *StateTransition) TransitionDb(refunds bool, gasBailout bool) (*Executi
 	if refunds {
 		st.refundGas()
 	}
-	st.state.AddBalance(st.evm.Context.Coinbase, new(uint256.Int).Mul(new(uint256.Int).SetUint64(st.gasUsed()), st.gasPrice))
+	st.state.AddBalance(st.evm.Coinbase, new(uint256.Int).Mul(new(uint256.Int).SetUint64(st.gasUsed()), st.gasPrice))
 
 	return &ExecutionResult{
 		UsedGas:    st.gasUsed(),

@@ -63,22 +63,24 @@ var (
 	byzantiumInstructionSet        = newByzantiumInstructionSet()
 	constantinopleInstructionSet   = newConstantinopleInstructionSet()
 	istanbulInstructionSet         = newIstanbulInstructionSet()
-	berlinInstructionSet           = newBerlinInstructionSet()
+	yoloV2InstructionSet           = newYoloV2InstructionSet()
 )
 
 // JumpTable contains the EVM opcodes supported at a given fork.
 type JumpTable [256]*operation
 
-// newBerlinInstructionSet returns the frontier, homestead, byzantium,
-// contantinople, istanbul, petersburg and berlin instructions.
-func newBerlinInstructionSet() JumpTable {
+// newYoloV2InstructionSet creates an instructionset containing
+// - "EIP-2315: Simple Subroutines"
+// - "EIP-2929: Gas cost increases for state access opcodes"
+func newYoloV2InstructionSet() JumpTable {
 	instructionSet := newIstanbulInstructionSet()
+	enable2315(&instructionSet) // Subroutines - https://eips.ethereum.org/EIPS/eip-2315
 	enable2929(&instructionSet) // Access lists for trie accesses https://eips.ethereum.org/EIPS/eip-2929
 	return instructionSet
 }
 
-// newIstanbulInstructionSet returns the frontier, homestead, byzantium,
-// contantinople, istanbul and petersburg instructions.
+// newIstanbulInstructionSet returns the frontier, homestead
+// byzantium, contantinople and petersburg instructions.
 func newIstanbulInstructionSet() JumpTable {
 	instructionSet := newConstantinopleInstructionSet()
 
@@ -89,7 +91,7 @@ func newIstanbulInstructionSet() JumpTable {
 	return instructionSet
 }
 
-// newConstantinopleInstructionSet returns the frontier, homestead,
+// newConstantinopleInstructionSet returns the frontier, homestead
 // byzantium and contantinople instructions.
 func newConstantinopleInstructionSet() JumpTable {
 	instructionSet := newByzantiumInstructionSet()

@@ -2,10 +2,17 @@ package ethapi
 
 import (
 	"bytes"
+	"context"
+	"math/big"
+	"sort"
 
 	"github.com/ledgerwatch/turbo-geth/common"
+	"github.com/ledgerwatch/turbo-geth/common/changeset"
+	"github.com/ledgerwatch/turbo-geth/common/dbutils"
 	"github.com/ledgerwatch/turbo-geth/common/hexutil"
+	"github.com/ledgerwatch/turbo-geth/core/rawdb"
 	"github.com/ledgerwatch/turbo-geth/core/types/accounts"
+	"github.com/ledgerwatch/turbo-geth/rpc"
 	"github.com/ledgerwatch/turbo-geth/turbo/trie"
 )
 
@@ -25,7 +32,6 @@ type StorageResult struct {
 	Proof []string     `json:"proof"`
 }
 
-/*TODO: to support proofs
 func (s *PublicBlockChainAPI) GetProof(ctx context.Context, address common.Address, storageKeys []string, blockNr rpc.BlockNumber) (*AccountResult, error) {
 	block := uint64(blockNr.Int64()) + 1
 	db := s.b.ChainDb()
@@ -113,16 +119,16 @@ func (s *PublicBlockChainAPI) GetProof(ctx context.Context, address common.Addre
 		}
 	}
 	sort.Strings(unfurlList)
-	loader := trie.NewFlatDBTrieLoader("checkRoots")
-	if err = loader.Reset(unfurl, nil, nil, false); err != nil {
-		panic(err)
+	loader := trie.NewFlatDbSubTrieLoader()
+	if err = loader.Reset(db, unfurl, unfurl, nil /* hashCollector */, [][]byte{nil}, []int{0}, false); err != nil {
+		return nil, err
 	}
 	r := &Receiver{defaultReceiver: trie.NewDefaultReceiver(), unfurlList: unfurlList, accountMap: accountMap, storageMap: storageMap}
-	r.defaultReceiver.Reset(rl, nil, false)
+	r.defaultReceiver.Reset(rl, nil /* hashCollector */, false)
 	loader.SetStreamReceiver(r)
-	_, err = loader.CalcTrieRoot(db.(ethdb.HasTx).Tx().(ethdb.RwTx), []byte{}, nil)
-	if err != nil {
-		panic(err)
+	subTries, err1 := loader.LoadSubTries()
+	if err1 != nil {
+		return nil, err1
 	}
 	hash, err := rawdb.ReadCanonicalHash(db, block-1)
 	if err != nil {
@@ -133,7 +139,7 @@ func (s *PublicBlockChainAPI) GetProof(ctx context.Context, address common.Addre
 	if err = tr.HookSubTries(subTries, [][]byte{nil}); err != nil {
 		return nil, err
 	}
-	accountProof, err2 := tr.Prove(addrHash[:], 0, false)
+	accountProof, err2 := tr.Prove(addrHash[:], 0, false /* storage */)
 	if err2 != nil {
 		return nil, err2
 	}
@@ -142,7 +148,7 @@ func (s *PublicBlockChainAPI) GetProof(ctx context.Context, address common.Addre
 		keyAsHash := common.HexToHash(key)
 		if keyHash, err1 := common.HashData(keyAsHash[:]); err1 == nil {
 			trieKey := append(addrHash[:], keyHash[:]...)
-			if proof, err3 := tr.Prove(trieKey, 64 , true); err3 == nil {
+			if proof, err3 := tr.Prove(trieKey, 64 /* nibbles to get to the storage sub-trie */, true /* storage */); err3 == nil {
 				v, _ := tr.Get(trieKey)
 				bv := new(big.Int)
 				bv.SetBytes(v)
@@ -167,9 +173,7 @@ func (s *PublicBlockChainAPI) GetProof(ctx context.Context, address common.Addre
 		StorageHash:  acc.Root,
 		StorageProof: storageProof,
 	}, nil
-	return &AccountResult{}, nil
 }
-*/
 
 type Receiver struct {
 	defaultReceiver *trie.DefaultReceiver
@@ -187,7 +191,7 @@ func (r *Receiver) Receive(
 	accountValue *accounts.Account,
 	storageValue []byte,
 	hash []byte,
-	hasTree bool,
+	hasBranch bool,
 	cutoff int,
 ) error {
 	for r.currentIdx < len(r.unfurlList) {
@@ -203,19 +207,19 @@ func (r *Receiver) Receive(
 			c = -1
 		}
 		if c > 0 {
-			return r.defaultReceiver.Receive(itemType, accountKey, storageKey, accountValue, storageValue, hash, hasTree, cutoff)
+			return r.defaultReceiver.Receive(itemType, accountKey, storageKey, accountValue, storageValue, hash, hasBranch, cutoff)
 		}
 		if len(k) > common.HashLength {
 			v := r.storageMap[ks]
 			if c <= 0 && len(v) > 0 {
-				if err := r.defaultReceiver.Receive(trie.StorageStreamItem, nil, k, nil, v, nil, hasTree, 0); err != nil {
+				if err := r.defaultReceiver.Receive(trie.StorageStreamItem, nil, k, nil, v, nil, hasBranch, 0); err != nil {
 					return err
 				}
 			}
 		} else {
 			v := r.accountMap[ks]
 			if c <= 0 && v != nil {
-				if err := r.defaultReceiver.Receive(trie.AccountStreamItem, k, nil, v, nil, nil, hasTree, 0); err != nil {
+				if err := r.defaultReceiver.Receive(trie.AccountStreamItem, k, nil, v, nil, nil, hasBranch, 0); err != nil {
 					return err
 				}
 			}
@@ -226,7 +230,7 @@ func (r *Receiver) Receive(
 		}
 	}
 	// We ran out of modifications, simply pass through
-	return r.defaultReceiver.Receive(itemType, accountKey, storageKey, accountValue, storageValue, hash, hasTree, cutoff)
+	return r.defaultReceiver.Receive(itemType, accountKey, storageKey, accountValue, storageValue, hash, hasBranch, cutoff)
 }
 
 func (r *Receiver) Result() trie.SubTries {

@@ -47,8 +47,7 @@ type Config struct {
 	EVMConfig   vm.Config
 
 	State     *state.IntraBlockState
-	r         state.StateReader
-	w         state.StateWriter
+	TrieDbSt  *state.TrieDbState
 	GetHashFn func(n uint64) common.Hash
 }
 
@@ -69,8 +68,7 @@ func setDefaults(cfg *Config) {
 			PetersburgBlock:     new(big.Int),
 			IstanbulBlock:       new(big.Int),
 			MuirGlacierBlock:    new(big.Int),
-			BerlinBlock:         new(big.Int),
-			YoloV3Block:         nil,
+			YoloV2Block:         nil,
 		}
 	}
 
@@ -113,17 +111,21 @@ func Execute(code, input []byte, cfg *Config, blockNr uint64) ([]byte, *state.In
 	if cfg.State == nil {
 		db := ethdb.NewMemDatabase()
 		defer db.Close()
-		cfg.r = state.NewDbStateReader(db)
-		cfg.w = state.NewDbStateWriter(db, 0)
-		cfg.State = state.New(cfg.r)
+		cfg.TrieDbSt = state.NewTrieDbState(common.Hash{}, db, blockNr)
+		cfg.State = state.New(cfg.TrieDbSt)
 	}
 	var (
 		address = common.BytesToAddress([]byte("contract"))
 		vmenv   = NewEnv(cfg)
 		sender  = vm.AccountRef(cfg.Origin)
 	)
-	if cfg.ChainConfig.IsBerlin(vmenv.Context.BlockNumber) {
-		cfg.State.PrepareAccessList(cfg.Origin, &address, vmenv.ActivePrecompiles(), nil)
+	if cfg.ChainConfig.IsYoloV2(vmenv.BlockNumber) {
+		cfg.State.AddAddressToAccessList(cfg.Origin)
+		cfg.State.AddAddressToAccessList(address)
+		for _, addr := range vmenv.ActivePrecompiles() {
+			cfg.State.AddAddressToAccessList(addr)
+			cfg.State.AddAddressToAccessList(addr)
+		}
 	}
 	cfg.State.CreateAccount(address, true)
 	// set the receiver's (the executing contract) code for execution.
@@ -151,16 +153,18 @@ func Create(input []byte, cfg *Config, blockNr uint64) ([]byte, common.Address, 
 	if cfg.State == nil {
 		db := ethdb.NewMemDatabase()
 		defer db.Close()
-		cfg.r = state.NewDbStateReader(db)
-		cfg.w = state.NewDbStateWriter(db, 0)
-		cfg.State = state.New(cfg.r)
+		cfg.TrieDbSt = state.NewTrieDbState(common.Hash{}, db, blockNr)
+		cfg.State = state.New(cfg.TrieDbSt)
 	}
 	var (
 		vmenv  = NewEnv(cfg)
 		sender = vm.AccountRef(cfg.Origin)
 	)
-	if cfg.ChainConfig.IsBerlin(vmenv.Context.BlockNumber) {
-		cfg.State.PrepareAccessList(cfg.Origin, nil, vmenv.ActivePrecompiles(), nil)
+	if cfg.ChainConfig.IsYoloV2(vmenv.BlockNumber) {
+		cfg.State.AddAddressToAccessList(cfg.Origin)
+		for _, addr := range vmenv.ActivePrecompiles() {
+			cfg.State.AddAddressToAccessList(addr)
+		}
 	}
 
 	// Call the code with the given configuration.
@@ -184,9 +188,12 @@ func Call(address common.Address, input []byte, cfg *Config) ([]byte, uint64, er
 	vmenv := NewEnv(cfg)
 
 	sender := cfg.State.GetOrNewStateObject(cfg.Origin)
-	statedb := cfg.State
-	if cfg.ChainConfig.IsBerlin(vmenv.Context.BlockNumber) {
-		statedb.PrepareAccessList(cfg.Origin, &address, vmenv.ActivePrecompiles(), nil)
+	if cfg.ChainConfig.IsYoloV2(vmenv.BlockNumber) {
+		cfg.State.AddAddressToAccessList(cfg.Origin)
+		cfg.State.AddAddressToAccessList(address)
+		for _, addr := range vmenv.ActivePrecompiles() {
+			cfg.State.AddAddressToAccessList(addr)
+		}
 	}
 
 	// Call the code with the given configuration.

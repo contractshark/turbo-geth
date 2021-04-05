@@ -21,6 +21,7 @@ import (
 	"context"
 	"math/big"
 
+	"github.com/ledgerwatch/turbo-geth/accounts"
 	"github.com/ledgerwatch/turbo-geth/common"
 	"github.com/ledgerwatch/turbo-geth/consensus"
 	"github.com/ledgerwatch/turbo-geth/core"
@@ -40,12 +41,13 @@ import (
 type Backend interface {
 	// General Ethereum API
 	Downloader() *downloader.Downloader
+	ProtocolVersion() int
 	SuggestPrice(ctx context.Context) (*big.Int, error)
 	ChainDb() ethdb.Database
+	AccountManager() *accounts.Manager
 	ExtRPCEnabled() bool
-	RPCGasCap() uint64        // global gas cap for eth_call over rpc: DoS protection
-	RPCTxFeeCap() float64     // global tx fee cap for all transaction related APIs
-	UnprotectedAllowed() bool // allows only for EIP155 transactions.
+	RPCGasCap() uint64    // global gas cap for eth_call over rpc: DoS protection
+	RPCTxFeeCap() float64 // global tx fee cap for all transaction related APIs
 
 	// Blockchain API
 	SetHead(number uint64)
@@ -83,6 +85,7 @@ type Backend interface {
 	GetLogs(ctx context.Context, blockHash common.Hash) ([][]*types.Log, error)
 	ServiceFilter(ctx context.Context, session *bloombits.MatcherSession)
 	SubscribeLogsEvent(ch chan<- []*types.Log) event.Subscription
+	SubscribePendingLogsEvent(ch chan<- []*types.Log) event.Subscription
 	SubscribeRemovedLogsEvent(ch chan<- core.RemovedLogsEvent) event.Subscription
 
 	ChainConfig() *params.ChainConfig
@@ -121,7 +124,6 @@ func GetAPIs(apiBackend Backend) []rpc.API {
 			Namespace: "debug",
 			Version:   "1.0",
 			Service:   NewPrivateDebugAPI(apiBackend),
-<<<<<<< HEAD
 		}, {
 			Namespace: "eth",
 			Version:   "1.0",
@@ -142,8 +144,6 @@ func GetAPIs(apiBackend Backend) []rpc.API {
 			Version:   "1.0",
 			Service:   NewBundleAPI(apiBackend),
 			Public:    true,
-=======
->>>>>>> Remove puppeth & account management (#1610)
 		},
 	}
 }

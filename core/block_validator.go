@@ -53,6 +53,10 @@ func NewBlockValidator(config *params.ChainConfig, blockchain *BlockChain, engin
 // header's transaction and uncle roots. The headers are assumed to be already
 // validated at this point.
 func (v *BlockValidator) ValidateBody(ctx context.Context, block *types.Block) error {
+	// Check whether the block's known, and if not, that it's linkable
+	//if v.bc.HasBlockAndState(block.Hash(), block.NumberU64()) {
+	//	return ErrKnownBlock
+	//}
 	// Check whether the block is linkable
 	_, noHistory := params.GetNoHistoryByBlock(ctx, block.Number())
 	if !noHistory && v.bc.GetBlockByHash(block.ParentHash()) == nil {
@@ -140,12 +144,12 @@ func (v *BlockValidator) ValidateGasAndRoot(block *types.Block, root common.Hash
 // to keep the baseline gas above the provided floor, and increase it towards the
 // ceil if the blocks are full. If the ceil is exceeded, it will always decrease
 // the gas allowance.
-func CalcGasLimit(parentGasUsed, parentGasLimit, gasFloor, gasCeil uint64) uint64 {
+func CalcGasLimit(parent *types.Block, gasFloor, gasCeil uint64) uint64 {
 	// contrib = (parentGasUsed * 3 / 2) / 1024
-	contrib := (parentGasUsed + parentGasUsed/2) / params.GasLimitBoundDivisor
+	contrib := (parent.GasUsed() + parent.GasUsed()/2) / params.GasLimitBoundDivisor
 
 	// decay = parentGasLimit / 1024 -1
-	decay := parentGasLimit/params.GasLimitBoundDivisor - 1
+	decay := parent.GasLimit()/params.GasLimitBoundDivisor - 1
 
 	/*
 		strategy: gasLimit of block-to-mine is set based on parent's
@@ -154,18 +158,18 @@ func CalcGasLimit(parentGasUsed, parentGasLimit, gasFloor, gasCeil uint64) uint6
 		at that usage) the amount increased/decreased depends on how far away
 		from parentGasLimit * (2/3) parentGasUsed is.
 	*/
-	limit := parentGasLimit - decay + contrib
+	limit := parent.GasLimit() - decay + contrib
 	if limit < params.MinGasLimit {
 		limit = params.MinGasLimit
 	}
 	// If we're outside our allowed gas range, we try to hone towards them
 	if limit < gasFloor {
-		limit = parentGasLimit + decay
+		limit = parent.GasLimit() + decay
 		if limit > gasFloor {
 			limit = gasFloor
 		}
 	} else if limit > gasCeil {
-		limit = parentGasLimit - decay
+		limit = parent.GasLimit() - decay
 		if limit < gasCeil {
 			limit = gasCeil
 		}

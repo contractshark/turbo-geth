@@ -204,7 +204,7 @@ var GenerateTrace bool
 // Blocks created by GenerateChain do not contain valid proof of work
 // values. Inserting them into BlockChain requires use of FakePow or
 // a similar non-validating proof of work implementation.
-func GenerateChain(config *params.ChainConfig, parent *types.Block, engine consensus.Engine, db ethdb.Database, n int, gen func(int, *BlockGen),
+func GenerateChain(config *params.ChainConfig, parent *types.Block, engine consensus.Engine, db *ethdb.ObjectDatabase, n int, gen func(int, *BlockGen),
 	intermediateHashes bool,
 ) ([]*types.Block, []types.Receipts, error) {
 	if config == nil {
@@ -212,7 +212,9 @@ func GenerateChain(config *params.ChainConfig, parent *types.Block, engine conse
 	}
 	blocks, receipts := make(types.Blocks, n), make([]types.Receipts, n)
 	chainreader := &fakeChainReader{config: config}
-	tx, errBegin := db.Begin(context.Background(), ethdb.RW)
+	dbCopy := db.MemCopy()
+	defer dbCopy.Close()
+	tx, errBegin := dbCopy.Begin(context.Background(), ethdb.RW)
 	if errBegin != nil {
 		return nil, nil, errBegin
 	}
@@ -245,6 +247,9 @@ func GenerateChain(config *params.ChainConfig, parent *types.Block, engine conse
 			}
 			ctx := config.WithEIPsFlags(context.Background(), b.header.Number)
 			// Write state changes to db
+			//if err := ibs.CommitBlock(ctx, stateWriter); err != nil {
+			//	return nil, nil, fmt.Errorf("call to CommitBlock to stateWriter:  %w", err)
+			//}
 			if err := ibs.CommitBlock(ctx, plainStateWriter); err != nil {
 				return nil, nil, fmt.Errorf("call to CommitBlock to plainStateWriter: %w", err)
 			}
@@ -259,10 +264,7 @@ func GenerateChain(config *params.ChainConfig, parent *types.Block, engine conse
 			}); err != nil {
 				return nil, nil, fmt.Errorf("clear HashedState bucket: %w", err)
 			}
-			c, err := tx.(ethdb.HasTx).Tx().Cursor(dbutils.PlainStateBucket)
-			if err != nil {
-				return nil, nil, err
-			}
+			c := tx.(ethdb.HasTx).Tx().Cursor(dbutils.PlainStateBucket)
 			h := common.NewHasher()
 			defer common.ReturnHasherToPool(h)
 			for k, v, err := c.First(); k != nil; k, v, err = c.Next() {
@@ -308,7 +310,14 @@ func GenerateChain(config *params.ChainConfig, parent *types.Block, engine conse
 				}
 				fmt.Printf("===============================\n")
 			}
-			if hash, err := trie.CalcRoot("GenerateChain", tx); err == nil {
+			var hashCollector func(keyHex []byte, _, _, _ uint16, hashes []byte, rootHash []byte) error
+			var storageHashCollector func(addrWithInc []byte, keyHex []byte, _, _, _ uint16, hashes []byte, rootHash []byte) error
+			unfurl := trie.NewRetainList(0)
+			loader := trie.NewFlatDBTrieLoader("GenerateChain")
+			if err := loader.Reset(unfurl, hashCollector, storageHashCollector, false); err != nil {
+				return nil, nil, fmt.Errorf("call to FlatDbSubTrieLoader.Reset: %w", err)
+			}
+			if hash, err := loader.CalcTrieRoot(tx, []byte{}, nil); err == nil {
 				b.header.Root = hash
 			} else {
 				return nil, nil, fmt.Errorf("call to CalcTrieRoot: %w", err)
@@ -334,8 +343,9 @@ func GenerateChain(config *params.ChainConfig, parent *types.Block, engine conse
 		parent = block
 	}
 
-	tx.Rollback()
-
+	if _, err := tx.Commit(); err != nil {
+		return nil, nil, err
+	}
 	return blocks, receipts, nil
 }
 
@@ -346,6 +356,7 @@ func makeHeader(chain consensus.ChainReader, parent *types.Block, state *state.I
 	} else {
 		time = parent.Time() + 10 // block time is fixed at 10 seconds
 	}
+	number := new(big.Int).Add(parent.Number(), common.Big1)
 
 	return &types.Header{
 		Root:       common.Hash{},
@@ -358,8 +369,9 @@ func makeHeader(chain consensus.ChainReader, parent *types.Block, state *state.I
 			parent.Hash(),
 			parent.UncleHash(),
 		),
-		GasLimit: CalcGasLimit(parent.GasUsed(), parent.GasLimit(), parent.GasLimit(), parent.GasLimit()),
-		Number:   new(big.Int).Add(parent.Number(), common.Big1),
+
+		GasLimit: CalcGasLimit(parent, 100*params.TxGas, 1000*params.TxGasContractCreation),
+		Number:   number,
 		Time:     time,
 	}
 }
